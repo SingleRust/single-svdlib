@@ -4,12 +4,13 @@ description = "A Rust port of LAS2 from SVDLIBC"
 keywords = ["svd"]
 categories = ["algorithms", "data-structures", "mathematics", "science"]
 name = "single-svdlib"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license-file = "SVDLIBC-LICENSE.txt"
 
 [dependencies]
 nalgebra-sparse = "0.10.0"
 ndarray = "0.16.1"
+num-traits = "0.2.19"
 rand = "0.8.5"
 thiserror = "2.0.9"
