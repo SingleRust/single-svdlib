@@ -1157,8 +1157,7 @@ fn ritvec<T: SvdFloat>(
         Some(500)
     } else if sparsity > T::from_f64(0.99).unwrap() {
         // Very sparse (>99%) - needs more iterations
-        // This specifically targets your 99.02% case
-        Some(200)
+        Some(300)
     } else if sparsity > T::from_f64(0.9).unwrap() {
         // Moderately sparse (>90%) - needs somewhat more iterations
         Some(100)
@@ -1350,7 +1349,7 @@ fn lanso<T: SvdFloat>(
         Some(500)
     } else if sparsity > T::from_f64(0.99).unwrap() {
         // Very sparse (>99%) - needs more iterations
-        Some(200)
+        Some(300)
     } else if sparsity > T::from_f64(0.9).unwrap() {
         // Moderately sparse (>90%) - needs somewhat more iterations
         Some(100)
