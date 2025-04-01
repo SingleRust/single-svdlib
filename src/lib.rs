@@ -20,19 +20,19 @@ mod simple_comparison_tests {
         use std::collections::HashSet;
 
         let mut coo = nalgebra_sparse::coo::CooMatrix::new(rows, cols);
-        
+
         let mut rng = StdRng::seed_from_u64(42);
-        
+
         let nnz = (rows as f64 * cols as f64 * density).round() as usize;
-        
+
         let nnz = nnz.max(1);
-        
+
         let mut positions = HashSet::new();
-        
+
         while positions.len() < nnz {
             let i = rng.gen_range(0..rows);
             let j = rng.gen_range(0..cols);
-            
+
             if positions.insert((i, j)) {
                 let val = loop {
                     let v: f64 = rng.gen_range(-10.0..10.0);
@@ -148,13 +148,23 @@ mod simple_comparison_tests {
             );
         }
     }
-    
-    
+
+
 
     #[test]
     fn test_real_sparse_matrix() {
         // Create a matrix with similar sparsity to your real one (99.02%)
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
+
+        // Should no longer fail with convergence error
+        let result = svd(&test_matrix); // Using your modified imtqlb
+        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
+    }
+
+    #[test]
+    fn test_real_sparse_matrix_very_big() {
+        // Create a matrix with similar sparsity to your real one (99.02%)
+        let test_matrix = create_sparse_matrix(10000, 1000, 0.0098); // 0.98% non-zeros
 
         // Should no longer fail with convergence error
         let result = svd(&test_matrix); // Using your modified imtqlb
