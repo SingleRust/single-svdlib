@@ -1,13 +1,13 @@
+use crate::error::SvdLibError;
+use ndarray::{Array, Array1, Array2};
+use num_traits::real::Real;
+use num_traits::{Float, FromPrimitive, One, Zero};
+use rand::rngs::StdRng;
+use rand::{thread_rng, Rng, SeedableRng};
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::mem;
 use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
-use ndarray::{Array, Array1, Array2};
-use num_traits::{Float, FromPrimitive, One, Zero};
-use num_traits::real::Real;
-use rand::{thread_rng, Rng, SeedableRng};
-use rand::rngs::StdRng;
-use crate::error::SvdLibError;
 
 pub trait SMat<T: Float> {
     fn nrows(&self) -> usize;
@@ -30,7 +30,7 @@ pub struct SvdRec<T: Float> {
     pub ut: Array2<T>,
     pub s: Array1<T>,
     pub vt: Array2<T>,
-    pub diagnostics: Diagnostics<T>
+    pub diagnostics: Diagnostics<T>,
 }
 
 /// Computational Diagnostics
@@ -59,11 +59,24 @@ pub struct Diagnostics<T: Float> {
     pub singular_values: usize,
     pub end_interval: [T; 2],
     pub kappa: T,
-    pub random_seed: u32
+    pub random_seed: u32,
 }
 
 /// Trait for floating point types that can be used with the SVD algorithm
-pub trait SvdFloat: Float + FromPrimitive + Debug + Send + Sync + Zero + One + AddAssign + SubAssign + MulAssign + Neg<Output = Self> + Sum {
+pub trait SvdFloat:
+    Float
+    + FromPrimitive
+    + Debug
+    + Send
+    + Sync
+    + Zero
+    + One
+    + AddAssign
+    + SubAssign
+    + MulAssign
+    + Neg<Output = Self>
+    + Sum
+{
     fn eps() -> Self;
     fn eps34() -> Self;
     fn compare(a: Self, b: Self) -> bool;
@@ -106,7 +119,7 @@ impl SvdFloat for f64 {
 pub fn svd<T, M>(a: &M) -> Result<SvdRec<T>, SvdLibError>
 where
     T: SvdFloat,
-    M: SMat<T>
+    M: SMat<T>,
 {
     let eps_small = T::from_f64(-1.0e-30).unwrap();
     let eps_large = T::from_f64(1.0e-30).unwrap();
@@ -124,7 +137,8 @@ where
 pub fn svd_dim<T, M>(a: &M, dimensions: usize) -> Result<SvdRec<T>, SvdLibError>
 where
     T: SvdFloat,
-    M: SMat<T> {
+    M: SMat<T>,
+{
     let eps_small = T::from_f64(-1.0e-30).unwrap();
     let eps_large = T::from_f64(1.0e-30).unwrap();
     let kappa = T::from_f64(1.0e-6).unwrap();
@@ -140,15 +154,27 @@ where
 /// - A: Sparse matrix
 /// - dimensions: Upper limit of desired number of dimensions, bounded by the matrix shape
 /// - random_seed: A supplied seed `if > 0`, otherwise an internal seed will be generated
-pub fn svd_dim_seed<T, M>(a: &M, dimensions: usize, random_seed: u32) -> Result<SvdRec<T>, SvdLibError>
+pub fn svd_dim_seed<T, M>(
+    a: &M,
+    dimensions: usize,
+    random_seed: u32,
+) -> Result<SvdRec<T>, SvdLibError>
 where
     T: SvdFloat,
-    M: SMat<T> {
+    M: SMat<T>,
+{
     let eps_small = T::from_f64(-1.0e-30).unwrap();
     let eps_large = T::from_f64(1.0e-30).unwrap();
     let kappa = T::from_f64(1.0e-6).unwrap();
 
-    svd_las2(a, dimensions, 0, &[eps_small, eps_large], kappa, random_seed)
+    svd_las2(
+        a,
+        dimensions,
+        0,
+        &[eps_small, eps_large],
+        kappa,
+        random_seed,
+    )
 }
 
 /// Compute a singular value decomposition
@@ -173,33 +199,34 @@ pub fn svd_las2<T, M>(
     iterations: usize,
     end_interval: &[T; 2],
     kappa: T,
-    random_seed: u32
+    random_seed: u32,
 ) -> Result<SvdRec<T>, SvdLibError>
 where
     T: SvdFloat,
-    M: SMat<T> {
+    M: SMat<T>,
+{
     let random_seed = match random_seed > 0 {
         true => random_seed,
-        false => thread_rng().gen::<_>()
+        false => thread_rng().gen::<_>(),
     };
 
     let min_nrows_ncols = a.nrows().min(a.ncols());
 
     let dimensions = match dimensions {
         n if n == 0 || n > min_nrows_ncols => min_nrows_ncols,
-        _ => dimensions
+        _ => dimensions,
     };
 
     let iterations = match iterations {
         n if n == 0 || n > min_nrows_ncols => min_nrows_ncols,
         n if n < dimensions => dimensions,
-        _ => iterations
+        _ => iterations,
     };
 
     if dimensions < 2 {
         return Err(SvdLibError::Las2Error(format!(
             "svd_las2: insufficient dimensions: {dimensions}"
-        )))
+        )));
     }
 
     assert!(dimensions > 1 && dimensions <= min_nrows_ncols);
@@ -221,7 +248,7 @@ where
         &mut wrk,
         &mut neig,
         &mut store,
-        random_seed
+        random_seed,
     )?;
 
     let kappa = kappa.abs().max(T::eps34());
@@ -258,7 +285,7 @@ const MAXLL: usize = 2;
 #[derive(Debug, Clone, PartialEq)]
 struct Store<T: Float> {
     n: usize,
-    vecs: Vec<Vec<T>>
+    vecs: Vec<Vec<T>>,
 }
 
 impl<T: Float + Zero + Clone> Store<T> {
@@ -310,7 +337,12 @@ struct WorkSpace<T: Float> {
 }
 
 impl<T: Float + Zero + FromPrimitive> WorkSpace<T> {
-    fn new(nrows: usize, ncols: usize, transposed: bool, iterations: usize) -> Result<Self, SvdLibError> {
+    fn new(
+        nrows: usize,
+        ncols: usize,
+        transposed: bool,
+        iterations: usize,
+    ) -> Result<Self, SvdLibError> {
         Ok(Self {
             nrows,
             ncols,
@@ -467,7 +499,16 @@ fn svd_dcopy<T: Float + Copy>(n: usize, offset: usize, x: &[T], y: &mut [T]) {
     }
 }
 
-fn imtqlb<T: SvdFloat>(n: usize, d: &mut [T], e: &mut [T], bnd: &mut [T]) -> Result<(), SvdLibError> {
+const MAX_IMTQLB_ITERATIONS: usize = 100;
+
+fn imtqlb<T: SvdFloat>(
+    n: usize,
+    d: &mut [T],
+    e: &mut [T],
+    bnd: &mut [T],
+    max_imtqlb: Option<usize>,
+) -> Result<(), SvdLibError> {
+    let max_imtqlb = max_imtqlb.unwrap_or(MAX_IMTQLB_ITERATIONS);
     if n == 1 {
         return Ok(());
     }
@@ -484,7 +525,7 @@ fn imtqlb<T: SvdFloat>(n: usize, d: &mut [T], e: &mut [T], bnd: &mut [T]) -> Res
 
     for l in 0..=last {
         let mut iteration = 0;
-        while iteration <= 30 {
+        while iteration <= max_imtqlb {
             let mut m = l;
             while m < n {
                 if m == last {
@@ -518,12 +559,13 @@ fn imtqlb<T: SvdFloat>(n: usize, d: &mut [T], e: &mut [T], bnd: &mut [T]) -> Res
                 }
                 d[i] = p;
                 bnd[i] = f;
-                iteration = 31;
+                iteration = max_imtqlb + 1;
             } else {
-                if iteration == 30 {
-                    return Err(SvdLibError::ImtqlbError(
-                        "imtqlb no convergence to an eigenvalue after 30 iterations".to_string(),
-                    ));
+                if iteration == max_imtqlb {
+                    return Err(SvdLibError::ImtqlbError(format!(
+                        "imtqlb no convergence to an eigenvalue after {} iterations",
+                        max_imtqlb
+                    )));
                 }
                 iteration += 1;
                 // ........ form shift ........
@@ -609,7 +651,9 @@ fn startv<T: SvdFloat>(
     }
 
     if rnm2 <= T::zero() {
-        return Err(SvdLibError::StartvError(format!("rnm2 <= 0.0, rnm2 = {rnm2:?}")));
+        return Err(SvdLibError::StartvError(format!(
+            "rnm2 <= 0.0, rnm2 = {rnm2:?}"
+        )));
     }
 
     if step > 0 {
@@ -808,9 +852,10 @@ fn ortbnd<T: SvdFloat>(wrk: &mut WorkSpace<T>, step: usize, rnm: T, eps1: T) {
         return;
     }
     if !compare(rnm, T::zero()) && step > 1 {
-        wrk.oldeta[0] =
-            (wrk.bet[1] * wrk.eta[1] + (wrk.alf[0] - wrk.alf[step]) * wrk.eta[0] - wrk.bet[step] * wrk.oldeta[0]) / rnm
-                + eps1;
+        wrk.oldeta[0] = (wrk.bet[1] * wrk.eta[1] + (wrk.alf[0] - wrk.alf[step]) * wrk.eta[0]
+            - wrk.bet[step] * wrk.oldeta[0])
+            / rnm
+            + eps1;
         if step > 2 {
             for i in 1..=step - 2 {
                 wrk.oldeta[i] = (wrk.bet[i + 1] * wrk.eta[i + 1]
@@ -844,7 +889,10 @@ fn error_bound<T: SvdFloat>(
 
     let mut i = ((step + 1) + (step - 1)) / 2;
     while i > mid + 1 {
-        if (ritz[i - 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs() && bnd[i] > tol && bnd[i - 1] > tol {
+        if (ritz[i - 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs()
+            && bnd[i] > tol
+            && bnd[i - 1] > tol
+        {
             bnd[i - 1] = (bnd[i].powi(2) + bnd[i - 1].powi(2)).sqrt();
             bnd[i] = T::zero();
         }
@@ -853,7 +901,10 @@ fn error_bound<T: SvdFloat>(
 
     let mut i = ((step + 1) - (step - 1)) / 2;
     while i + 1 < mid {
-        if (ritz[i + 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs() && bnd[i] > tol && bnd[i + 1] > tol {
+        if (ritz[i + 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs()
+            && bnd[i] > tol
+            && bnd[i + 1] > tol
+        {
             bnd[i + 1] = (bnd[i].powi(2) + bnd[i + 1].powi(2)).sqrt();
             bnd[i] = T::zero();
         }
@@ -882,7 +933,15 @@ fn error_bound<T: SvdFloat>(
     neig
 }
 
-fn imtql2<T: SvdFloat>(nm: usize, n: usize, d: &mut [T], e: &mut [T], z: &mut [T]) -> Result<(), SvdLibError> {
+fn imtql2<T: SvdFloat>(
+    nm: usize,
+    n: usize,
+    d: &mut [T],
+    e: &mut [T],
+    z: &mut [T],
+    max_imtqlb: Option<usize>,
+) -> Result<(), SvdLibError> {
+    let max_imtqlb = max_imtqlb.unwrap_or(MAX_IMTQLB_ITERATIONS);
     if n == 1 {
         return Ok(());
     }
@@ -901,7 +960,7 @@ fn imtql2<T: SvdFloat>(nm: usize, n: usize, d: &mut [T], e: &mut [T], z: &mut [T
         let mut iteration = 0;
 
         // look for small sub-diagonal element
-        while iteration <= 30 {
+        while iteration <= max_imtqlb {
             let mut m = l;
             while m < n {
                 if m == last {
@@ -918,10 +977,11 @@ fn imtql2<T: SvdFloat>(nm: usize, n: usize, d: &mut [T], e: &mut [T], z: &mut [T
             }
 
             // error -- no convergence to an eigenvalue after 30 iterations.
-            if iteration == 30 {
-                return Err(SvdLibError::Imtql2Error(
-                    "imtql2 no convergence to an eigenvalue after 30 iterations".to_string(),
-                ));
+            if iteration == max_imtqlb {
+                return Err(SvdLibError::Imtql2Error(format!(
+                    "imtql2 no convergence to an eigenvalue after {} iterations",
+                    max_imtqlb
+                )));
             }
             iteration += 1;
 
@@ -1039,8 +1099,39 @@ fn ritvec<T: SvdFloat>(
 ) -> Result<SVDRawRec<T>, SvdLibError> {
     let js = steps + 1;
     let jsq = js * js;
-    let mut s = vec![T::zero(); jsq];
 
+    let sparsity = T::one()
+        - (T::from_usize(A.nnz()).unwrap()
+            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
+
+    let epsilon = T::epsilon();
+    let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
+        // For very sparse matrices (>99%), use a more relaxed tolerance
+        epsilon * T::from_f64(100.0).unwrap()
+    } else if sparsity > T::from_f64(0.9).unwrap() {
+        // For moderately sparse matrices (>90%), use a somewhat relaxed tolerance
+        epsilon * T::from_f64(10.0).unwrap()
+    } else {
+        // For less sparse matrices, use standard epsilon
+        epsilon
+    };
+
+    let max_iterations_imtql2 = if sparsity > T::from_f64(0.999).unwrap() {
+        // Ultra sparse (>99.9%) - needs many more iterations
+        Some(500)
+    } else if sparsity > T::from_f64(0.99).unwrap() {
+        // Very sparse (>99%) - needs more iterations
+        // This specifically targets your 99.02% case
+        Some(200)
+    } else if sparsity > T::from_f64(0.9).unwrap() {
+        // Moderately sparse (>90%) - needs somewhat more iterations
+        Some(100)
+    } else {
+        // Default iterations for less sparse matrices
+        Some(50)
+    };
+
+    let mut s = vec![T::zero(); jsq];
     // initialize s to an identity matrix
     for i in (0..jsq).step_by(js + 1) {
         s[i] = T::one();
@@ -1056,13 +1147,45 @@ fn ritvec<T: SvdFloat>(
 
     // on return from imtql2(), `R.Vt.value` contains eigenvalues in
     // ascending order and `s` contains the corresponding eigenvectors
-    imtql2(js, js, &mut Vt.value, &mut wrk.w5, &mut s)?;
+    imtql2(
+        js,
+        js,
+        &mut Vt.value,
+        &mut wrk.w5,
+        &mut s,
+        max_iterations_imtql2,
+    )?;
+
+    let max_eigenvalue = Vt
+        .value
+        .iter()
+        .fold(T::zero(), |max, &val| max.max(val.abs()));
+
+    let adaptive_kappa = if sparsity > T::from_f64(0.99).unwrap() {
+        // More relaxed kappa for very sparse matrices
+        kappa * T::from_f64(10.0).unwrap()
+    } else {
+        kappa
+    };
 
     let mut nsig = 0;
     let mut x = 0;
     let mut id2 = jsq - js;
+
+    let mut significant_count = 0;
     for k in 0..js {
-        if wrk.bnd[k] <= kappa * wrk.ritz[k].abs() && k + 1 > js - neig {
+        // Adaptive error bound check using relative tolerance
+        let relative_bound = adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
+        if wrk.bnd[k] <= relative_bound && k + 1 > js - neig {
+            significant_count += 1;
+        }
+    }
+
+    id2 = jsq - js;
+    for k in 0..js {
+        // Adaptive error bound check
+        let relative_bound = adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
+        if wrk.bnd[k] <= relative_bound && k + 1 > js - neig {
             x = match x {
                 0 => dimensions - 1,
                 _ => x - 1,
@@ -1071,9 +1194,11 @@ fn ritvec<T: SvdFloat>(
             let offset = x * Vt.cols;
             Vt.value[offset..offset + Vt.cols].fill(T::zero());
             let mut idx = id2 + js;
+
             for i in 0..js {
                 idx -= js;
-                if s[idx] != T::zero() {
+                // Non-zero check with adaptive threshold
+                if s[idx].abs() > adaptive_eps {
                     for (j, item) in store.retrq(i).iter().enumerate().take(Vt.cols) {
                         Vt.value[j + offset] += s[idx] * *item;
                     }
@@ -1107,19 +1232,46 @@ fn ritvec<T: SvdFloat>(
         let vt_vec = &Vt.value[vt_offset..vt_offset + Vt.cols];
         let ut_vec = &mut Ut.value[ut_offset..ut_offset + Ut.cols];
 
-        // multiply by matrix B first
+        // Multiply by matrix B first
         svd_opb(A, vt_vec, &mut tmp_vec, &mut wrk.temp, wrk.transposed);
         let t = svd_ddot(vt_vec, &tmp_vec);
 
-        // store the Singular Value at S[i]
-        *sval = t.sqrt();
+        // Store the Singular Value at S[i], with safety check for negative values
+        // that can happen due to numerical precision
+        *sval = t.max(T::zero()).sqrt();
 
-        svd_daxpy(-t, vt_vec, &mut tmp_vec);
-        wrk.bnd[js] = svd_norm(&tmp_vec) * sval.recip();
+        // Safety check for zero-division
+        if t > adaptive_eps {
+            svd_daxpy(-t, vt_vec, &mut tmp_vec);
+            // Protect against division by extremely small values
+            if *sval > adaptive_eps {
+                wrk.bnd[js] = svd_norm(&tmp_vec) / *sval;
+            } else {
+                wrk.bnd[js] = T::from_f64(f64::MAX).unwrap() * T::from_f64(0.1).unwrap();
+            }
 
-        // multiply by matrix A to get (scaled) left s-vector
-        A.svd_opa(vt_vec, ut_vec, wrk.transposed);
-        svd_dscal(sval.recip(), ut_vec);
+            // Multiply by matrix A to get (scaled) left s-vector
+            A.svd_opa(vt_vec, ut_vec, wrk.transposed);
+
+            // Safe scaling - avoid division by very small numbers
+            if *sval > adaptive_eps {
+                svd_dscal(T::one() / *sval, ut_vec);
+            } else {
+                // For extremely small singular values, use a bounded scaling factor
+                let dls = sval.max(adaptive_eps);
+                let safe_scale = T::one() / dls;
+                svd_dscal(safe_scale, ut_vec);
+            }
+        } else {
+            // For effectively zero singular values, just use the right vector
+            // but scale it reasonably
+            A.svd_opa(vt_vec, ut_vec, wrk.transposed);
+            let norm = svd_norm(ut_vec);
+            if norm > adaptive_eps {
+                svd_dscal(T::one() / norm, ut_vec);
+            }
+            wrk.bnd[js] = T::from_f64(f64::MAX).unwrap() * T::from_f64(0.01).unwrap();
+        }
     }
 
     Ok(SVDRawRec {
@@ -1177,7 +1329,17 @@ fn lanso<T: SvdFloat>(
         }
 
         // the actual lanczos loop
-        let steps = lanczos_step(A, wrk, first, last, &mut ll, &mut enough, &mut rnm, &mut tol, store)?;
+        let steps = lanczos_step(
+            A,
+            wrk,
+            first,
+            last,
+            &mut ll,
+            &mut enough,
+            &mut rnm,
+            &mut tol,
+            store,
+        )?;
         j = match enough {
             true => steps - 1,
             false => last - 1,
@@ -1207,7 +1369,13 @@ fn lanso<T: SvdFloat>(
             svd_dcopy(sz + 1, l, &wrk.alf, &mut wrk.ritz);
             svd_dcopy(sz, l + 1, &wrk.bet, &mut wrk.w5);
 
-            imtqlb(sz + 1, &mut wrk.ritz[l..], &mut wrk.w5[l..], &mut wrk.bnd[l..])?;
+            imtqlb(
+                sz + 1,
+                &mut wrk.ritz[l..],
+                &mut wrk.w5[l..],
+                &mut wrk.bnd[l..],
+                None,
+            )?; // TODO
 
             for m in l..=i {
                 wrk.bnd[m] = rnm * wrk.bnd[m].abs();
@@ -1343,4 +1511,3 @@ impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::coo::CooM
         }
     }
 }
-

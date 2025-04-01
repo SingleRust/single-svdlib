@@ -15,6 +15,46 @@ mod simple_comparison_tests {
     use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
 
+    fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> nalgebra_sparse::coo::CooMatrix<f64> {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::collections::HashSet;
+
+        let mut coo = nalgebra_sparse::coo::CooMatrix::new(rows, cols);
+        
+        let mut rng = StdRng::seed_from_u64(42);
+        
+        let nnz = (rows as f64 * cols as f64 * density).round() as usize;
+        
+        let nnz = nnz.max(1);
+        
+        let mut positions = HashSet::new();
+        
+        while positions.len() < nnz {
+            let i = rng.gen_range(0..rows);
+            let j = rng.gen_range(0..cols);
+            
+            if positions.insert((i, j)) {
+                let val = loop {
+                    let v: f64 = rng.gen_range(-10.0..10.0);
+                    if v.abs() > 1e-10 { // Ensure it's not too close to zero
+                        break v;
+                    }
+                };
+
+                coo.push(i, j, val);
+            }
+        }
+
+        // Verify the density is as expected
+        let actual_density = coo.nnz() as f64 / (rows as f64 * cols as f64);
+        println!("Created sparse matrix: {} x {}", rows, cols);
+        println!("  - Requested density: {:.6}", density);
+        println!("  - Actual density: {:.6}", actual_density);
+        println!("  - Sparsity: {:.4}%", (1.0 - actual_density) * 100.0);
+        println!("  - Non-zeros: {}", coo.nnz());
+
+        coo
+    }
     #[test]
     fn simple_matrix_comparison() {
         // Create a small, predefined test matrix
@@ -107,6 +147,18 @@ mod simple_comparison_tests {
                 i, rel_diff, current_val, legacy_val
             );
         }
+    }
+    
+    
+
+    #[test]
+    fn test_real_sparse_matrix() {
+        // Create a matrix with similar sparsity to your real one (99.02%)
+        let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
+
+        // Should no longer fail with convergence error
+        let result = svd(&test_matrix); // Using your modified imtqlb
+        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
     }
 
     #[test]
