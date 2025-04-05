@@ -4,6 +4,9 @@ use num_traits::real::Real;
 use num_traits::{Float, FromPrimitive, One, Zero};
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
+use rayon::iter::IndexedParallelIterator;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::{IntoParallelRefIterator, IntoParallelRefMutIterator};
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::mem;
@@ -411,9 +414,15 @@ fn svd_opb<T: Float>(A: &dyn SMat<T>, x: &[T], y: &mut [T], temp: &mut [T], tran
 }
 
 // constant times a vector plus a vector
-fn svd_daxpy<T: Float + AddAssign>(da: T, x: &[T], y: &mut [T]) {
-    for (xval, yval) in x.iter().zip(y.iter_mut()) {
-        *yval += da * *xval
+fn svd_daxpy<T: Float + AddAssign + Send + Sync>(da: T, x: &[T], y: &mut [T]) {
+    if x.len() < 1000 {
+        for (xval, yval) in x.iter().zip(y.iter_mut()) {
+            *yval += da * *xval
+        }
+    } else {
+        y.par_iter_mut().zip(x.par_iter()).for_each(|(yval, xval)| {
+            *yval += da * *xval
+        });
     }
 }
 
@@ -466,12 +475,16 @@ fn svd_pythag<T: SvdFloat + FromPrimitive>(a: T, b: T) -> T {
 }
 
 // dot product of two vectors
-fn svd_ddot<T: Float + Sum<T>>(x: &[T], y: &[T]) -> T {
-    x.iter().zip(y).map(|(a, b)| *a * *b).sum()
+fn svd_ddot<T: Float + Sum<T> + Send + Sync>(x: &[T], y: &[T]) -> T {
+    if x.len() < 1000 {
+        x.iter().zip(y).map(|(a, b)| *a * *b).sum()
+    } else {
+        x.par_iter().zip(y.par_iter()).map(|(a, b)| *a * *b).sum()
+    }
 }
 
 // norm (length) of a vector
-fn svd_norm<T: Float + Sum<T>>(x: &[T]) -> T {
+fn svd_norm<T: Float + Sum<T> + Send + Sync>(x: &[T]) -> T {
     svd_ddot(x, x).sqrt()
 }
 
@@ -483,9 +496,15 @@ fn svd_datx<T: Float + Sum<T>>(d: T, x: &[T], y: &mut [T]) {
 }
 
 // scales an input vector 'x' by a constant, modifying 'x'
-fn svd_dscal<T: Float + MulAssign>(d: T, x: &mut [T]) {
-    for elem in x.iter_mut() {
-        *elem *= d;
+fn svd_dscal<T: Float + MulAssign + Send + Sync>(d: T, x: &mut [T]) {
+    if x.len() < 1000 {
+        for elem in x.iter_mut() {
+            *elem *= d;
+        }
+    } else {
+        x.par_iter_mut().for_each(|elem| {
+            *elem *= d;
+        });
     }
 }
 
@@ -1526,6 +1545,7 @@ impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::csr::CsrM
 
     /// takes an n-vector x and returns A*x in y
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
+        //TODO parallelize me please
         let nrows = if transposed { self.ncols() } else { self.nrows() };
         let ncols = if transposed { self.nrows() } else { self.ncols() };
         assert_eq!(x.len(), ncols, "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}", x.len(), ncols);
