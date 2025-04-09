@@ -1157,7 +1157,7 @@ fn ritvec<T: SvdFloat>(
 
     let sparsity = T::one()
         - (T::from_usize(A.nnz()).unwrap()
-            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
+        / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
 
     let epsilon = T::epsilon();
     let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
@@ -1179,7 +1179,7 @@ fn ritvec<T: SvdFloat>(
         Some(300)
     } else if sparsity > T::from_f64(0.9).unwrap() {
         // Moderately sparse (>90%) - needs somewhat more iterations
-        Some(100)
+        Some(200)
     } else {
         // Default iterations for less sparse matrices
         Some(50)
@@ -1262,12 +1262,6 @@ fn ritvec<T: SvdFloat>(
     // Sort by k value to maintain original order
     vt_vectors.sort_by_key(|(k, _)| *k);
 
-    // Rotate the singular vectors and values.
-    // `x` is now the location of the highest singular value.
-    if x > 0 {
-        rotate_array(&mut Vt.value, x * Vt.cols);
-    }
-
     // final dimension size
     let d = dimensions.min(nsig);
     let mut S = vec![T::zero(); d];
@@ -1275,22 +1269,8 @@ fn ritvec<T: SvdFloat>(
         cols: wrk.nrows,
         value: vec![T::zero(); wrk.nrows * d],
     };
-    let mut Vt = DMat {
-        cols: wrk.ncols,
-        value: vec![T::zero(); wrk.ncols * d],
-    };
 
-    for (i, (_, vec)) in vt_vectors.into_iter().take(d).enumerate() {
-        let vt_offset = i * Vt.cols;
-        Vt.value[vt_offset..vt_offset + Vt.cols].copy_from_slice(&vec);
-    }
-
-    let d = dimensions.min(nsig);
-    let mut S = vec![T::zero(); d];
-    let mut Ut = DMat {
-        cols: wrk.nrows,
-        value: vec![T::zero(); wrk.nrows * d],
-    };
+    // Create new Vt with the correct size
     let mut Vt = DMat {
         cols: wrk.ncols,
         value: vec![T::zero(); wrk.ncols * d],
@@ -1342,12 +1322,10 @@ fn ritvec<T: SvdFloat>(
         S[i] = sval;
         let ut_offset = i * Ut.cols;
         let mut ut_vec = a_products[i].clone();
-
-        // Safe scaling - avoid division by very small numbers
+        
         if sval > adaptive_eps {
             svd_dscal(T::one() / sval, &mut ut_vec);
         } else {
-            // For extremely small singular values, use a bounded scaling factor
             let dls = sval.max(adaptive_eps);
             let safe_scale = T::one() / dls;
             svd_dscal(safe_scale, &mut ut_vec);
@@ -1528,7 +1506,7 @@ impl<T: SvdFloat + 'static> SvdRec<T> {
 }
 
 #[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::csc::CscMatrix<T> {
+impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csc::CscMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
     fn nnz(&self) -> usize { self.nnz() }
@@ -1563,7 +1541,7 @@ impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::csc::CscM
 }
 
 #[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
+impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
     fn nnz(&self) -> usize { self.nnz() }
@@ -1599,7 +1577,7 @@ impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::csr::CsrM
 }
 
 #[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
+impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
     fn nnz(&self) -> usize { self.nnz() }

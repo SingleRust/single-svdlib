@@ -158,28 +158,32 @@ mod simple_comparison_tests {
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
         
         // Should no longer fail with convergence error
-        let result = svd_dim_seed(&test_matrix, 50, 42); // Using your modified imtqlb
+        let result = svd_dim_seed(&test_matrix, 50, 42);
         assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
     }
 
     #[test]
     fn test_real_sparse_matrix_very_big() {
         // Create a matrix with similar sparsity to your real one (99.02%)
-        let test_matrix = create_sparse_matrix(10000, 1000, 0.0098); // 0.98% non-zeros
+        let test_matrix = create_sparse_matrix(10000, 1000, 0.01); // 0.98% non-zeros
 
         // Should no longer fail with convergence error
-        let result = svd_dim_seed(&test_matrix, 50, 42); // Using your modified imtqlb
-        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+        let result = thread_pool.install(|| {
+            svd_dim_seed(&test_matrix, 50, 42)
+        });
+        assert!(result.is_ok(), "{}", format!("SVD failed on 99% sparse matrix, {:?}", result.err().unwrap()));
     }
 
     #[test]
     fn test_real_sparse_matrix_very_very_big() {
         // Create a matrix with similar sparsity to your real one (99.02%)
-        let test_matrix = create_sparse_matrix(100000, 2500, 0.0098); // 0.98% non-zeros
+        let test_matrix = create_sparse_matrix(100000, 2500, 0.01); // 0.98% non-zeros
 
         // Should no longer fail with convergence error
-        let result = svd(&test_matrix); // Using your modified imtqlb
-        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
+
+        let result = svd(&test_matrix);
+        assert!(result.is_ok(), "{}", format!("SVD failed on 99% sparse matrix, {:?}", result.err().unwrap()));
     }
 
     //#[test]
