@@ -1,6 +1,9 @@
+use crate::utils::determine_chunk_size;
 use crate::{SMat, SvdFloat};
 use nalgebra_sparse::CsrMatrix;
 use num_traits::Float;
+use rayon::iter::ParallelIterator;
+use rayon::prelude::{IntoParallelIterator, ParallelBridge};
 use std::ops::AddAssign;
 
 pub struct MaskedCSRMatrix<'a, T: Float> {
@@ -47,12 +50,10 @@ impl<'a, T: Float> MaskedCSRMatrix<'a, T> {
         Self::new(matrix, mask)
     }
 
-    // Add this method to help with small matrix comparison tests
     pub fn uses_all_columns(&self) -> bool {
         self.masked_to_original.len() == self.matrix.ncols() && self.column_mask.iter().all(|&x| x)
     }
 
-    // Add this method for special case handling
     pub fn ensure_identical_results_mode(&self) -> bool {
         // For very small matrices where precision is critical
         let is_small_matrix = self.matrix.nrows() <= 5 && self.matrix.ncols() <= 5;
@@ -60,7 +61,7 @@ impl<'a, T: Float> MaskedCSRMatrix<'a, T> {
     }
 }
 
-impl<'a, T: Float + AddAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
+impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> {
     fn nrows(&self) -> usize {
         self.matrix.nrows()
     }
@@ -75,7 +76,7 @@ impl<'a, T: Float + AddAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
 
         for i in 0..self.matrix.nrows() {
             for j in major_offsets[i]..major_offsets[i + 1] {
-                let col = minor_indices[j]; // Fixed: Use j instead of i
+                let col = minor_indices[j]; 
                 if self.column_mask[col] {
                     count += 1;
                 }
@@ -85,6 +86,7 @@ impl<'a, T: Float + AddAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
     }
 
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
+        // TODO  parallelize me please
         let nrows = if transposed {
             self.ncols()
         } else {
@@ -132,15 +134,26 @@ impl<'a, T: Float + AddAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
                     y[i] = sum;
                 }
             } else {
-                // Standard implementation for normal cases
-                for i in 0..self.matrix.nrows() {
-                    for j in major_offsets[i]..major_offsets[i + 1] {
-                        let col = minor_indices[j];
-                        if let Some(masked_col) = self.original_to_masked[col] {
-                            y[i] += values[j] * x[masked_col];
+                let chunk_size = determine_chunk_size(self.matrix.nrows());
+                y.chunks_mut(chunk_size).enumerate().par_bridge().for_each(
+                    |(chunk_idx, y_chunk)| {
+                        let start_row = chunk_idx * chunk_size;
+                        let end_row = (start_row + y_chunk.len()).min(self.matrix.nrows());
+
+                        for i in start_row..end_row {
+                            let row_idx = i - start_row;
+                            let mut sum = T::zero();
+
+                            for j in major_offsets[i]..major_offsets[i + 1] {
+                                let col = minor_indices[j];
+                                if let Some(masked_col) = self.original_to_masked[col] {
+                                    sum += values[j] * x[masked_col];
+                                };
+                            }
+                            y_chunk[row_idx] = sum;
                         }
-                    }
-                }
+                    },
+                );
             }
         } else {
             // For the transposed case (A^T * x)
@@ -160,13 +173,35 @@ impl<'a, T: Float + AddAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
                     }
                 }
             } else {
-                // Existing implementation for transposed case
-                for i in 0..self.matrix.nrows() {
-                    let row_val = x[i];
-                    for j in major_offsets[i]..major_offsets[i + 1] {
-                        let col = minor_indices[j];
-                        if let Some(masked_col) = self.original_to_masked[col] {
-                            y[masked_col] += values[j] * row_val;
+                let nrows = self.matrix.nrows();
+                let chunk_size = determine_chunk_size(nrows);
+                let num_chunks = (nrows + chunk_size - 1) / chunk_size;
+                let results: Vec<Vec<T>> = (0..chunk_size)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * chunk_size;
+                        let end = (start + chunk_size).min(nrows);
+
+                        let mut local_y = vec![T::zero(); y.len()];
+                        for i in start..end {
+                            let row_val = x[i];
+                            for j in major_offsets[i]..major_offsets[i + 1] {
+                                let col = minor_indices[j];
+                                if let Some(masked_col) = self.original_to_masked[col] {
+                                    local_y[masked_col] += values[j] * row_val;
+                                }
+                            }
+                        }
+                        local_y
+                    })
+                    .collect();
+
+                y.fill(T::zero());
+
+                for local_y in results {
+                    for (idx, val) in local_y.iter().enumerate() {
+                        if !val.is_zero() {
+                            y[idx] += *val;
                         }
                     }
                 }

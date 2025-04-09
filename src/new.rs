@@ -6,13 +6,13 @@ use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{IntoParallelRefIterator, IntoParallelRefMutIterator};
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::mem;
 use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
 
-pub trait SMat<T: Float> {
+pub trait SMat<T: Float>: Sync {
     fn nrows(&self) -> usize;
     fn ncols(&self) -> usize;
     fn nnz(&self) -> usize;
@@ -420,9 +420,9 @@ fn svd_daxpy<T: Float + AddAssign + Send + Sync>(da: T, x: &[T], y: &mut [T]) {
             *yval += da * *xval
         }
     } else {
-        y.par_iter_mut().zip(x.par_iter()).for_each(|(yval, xval)| {
-            *yval += da * *xval
-        });
+        y.par_iter_mut()
+            .zip(x.par_iter())
+            .for_each(|(yval, xval)| *yval += da * *xval);
     }
 }
 
@@ -1222,46 +1222,45 @@ fn ritvec<T: SvdFloat>(
         kappa
     };
 
-    let mut nsig = 0;
-    let mut x = 0;
-    let mut id2 = jsq - js;
+    let mut x = dimensions - 1;
 
-    let mut significant_count = 0;
-    for k in 0..js {
-        // Adaptive error bound check using relative tolerance
-        let relative_bound = adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
-        if wrk.bnd[k] <= relative_bound && k + 1 > js - neig {
-            significant_count += 1;
-        }
-    }
+    let store_vectors: Vec<Vec<T>> = (0..js).map(|i| store.retrq(i).to_vec()).collect();
 
-    id2 = jsq - js;
-    for k in 0..js {
-        // Adaptive error bound check
-        let relative_bound = adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
-        if wrk.bnd[k] <= relative_bound && k + 1 > js - neig {
-            x = match x {
-                0 => dimensions - 1,
-                _ => x - 1,
-            };
+    let significant_indices: Vec<usize> = (0..js)
+        .into_par_iter()
+        .filter(|&k| {
+            // Adaptive error bound check using relative tolerance
+            let relative_bound =
+                adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
+            wrk.bnd[k] <= relative_bound && k + 1 > js - neig
+        })
+        .collect();
 
-            let offset = x * Vt.cols;
-            Vt.value[offset..offset + Vt.cols].fill(T::zero());
-            let mut idx = id2 + js;
+    let nsig = significant_indices.len();
+
+    let mut vt_vectors: Vec<(usize, Vec<T>)> = significant_indices
+        .into_par_iter()
+        .map(|k| {
+            let mut vec = vec![T::zero(); wrk.ncols];
+            let mut idx = (jsq - js) + k + 1;
 
             for i in 0..js {
                 idx -= js;
                 // Non-zero check with adaptive threshold
                 if s[idx].abs() > adaptive_eps {
-                    for (j, item) in store.retrq(i).iter().enumerate().take(Vt.cols) {
-                        Vt.value[j + offset] += s[idx] * *item;
+                    for (j, item) in store_vectors[i].iter().enumerate().take(wrk.ncols) {
+                        vec[j] += s[idx] * *item;
                     }
                 }
             }
-            nsig += 1;
-        }
-        id2 += 1;
-    }
+
+            // Return with position index (for proper ordering)
+            (k, vec)
+        })
+        .collect();
+
+    // Sort by k value to maintain original order
+    vt_vectors.sort_by_key(|(k, _)| *k);
 
     // Rotate the singular vectors and values.
     // `x` is now the location of the highest singular value.
@@ -1276,72 +1275,98 @@ fn ritvec<T: SvdFloat>(
         cols: wrk.nrows,
         value: vec![T::zero(); wrk.nrows * d],
     };
-    Vt.value.resize(Vt.cols * d, T::zero());
+    let mut Vt = DMat {
+        cols: wrk.ncols,
+        value: vec![T::zero(); wrk.ncols * d],
+    };
 
-    let mut tmp_vec = vec![T::zero(); Vt.cols];
-    for (i, sval) in S.iter_mut().enumerate() {
+    for (i, (_, vec)) in vt_vectors.into_iter().take(d).enumerate() {
         let vt_offset = i * Vt.cols;
-        let ut_offset = i * Ut.cols;
+        Vt.value[vt_offset..vt_offset + Vt.cols].copy_from_slice(&vec);
+    }
 
+    let d = dimensions.min(nsig);
+    let mut S = vec![T::zero(); d];
+    let mut Ut = DMat {
+        cols: wrk.nrows,
+        value: vec![T::zero(); wrk.nrows * d],
+    };
+    let mut Vt = DMat {
+        cols: wrk.ncols,
+        value: vec![T::zero(); wrk.ncols * d],
+    };
+
+    // Fill Vt with the vectors we computed
+    for (i, (_, vec)) in vt_vectors.into_iter().take(d).enumerate() {
+        let vt_offset = i * Vt.cols;
+        Vt.value[vt_offset..vt_offset + Vt.cols].copy_from_slice(&vec);
+    }
+
+    // Prepare for parallel computation of S and Ut
+    let mut ab_products = Vec::with_capacity(d);
+    let mut a_products = Vec::with_capacity(d);
+
+    // First compute all matrix-vector products sequentially
+    for i in 0..d {
+        let vt_offset = i * Vt.cols;
         let vt_vec = &Vt.value[vt_offset..vt_offset + Vt.cols];
-        let ut_vec = &mut Ut.value[ut_offset..ut_offset + Ut.cols];
 
-        // Multiply by matrix B first
+        let mut tmp_vec = vec![T::zero(); Vt.cols];
+        let mut ut_vec = vec![T::zero(); wrk.nrows];
+
+        // Matrix-vector products with A and A'A
         svd_opb(A, vt_vec, &mut tmp_vec, &mut wrk.temp, wrk.transposed);
-        let t = svd_ddot(vt_vec, &tmp_vec);
+        A.svd_opa(vt_vec, &mut ut_vec, wrk.transposed);
 
-        // Store the Singular Value at S[i], with safety check for negative values
-        // that can happen due to numerical precision
-        *sval = t.max(T::zero()).sqrt();
+        ab_products.push(tmp_vec);
+        a_products.push(ut_vec);
+    }
 
-        // Safety check for zero-division
-        if t > adaptive_eps {
-            svd_daxpy(-t, vt_vec, &mut tmp_vec);
-            // Protect against division by extremely small values
-            if *sval > adaptive_eps {
-                wrk.bnd[js] = svd_norm(&tmp_vec) / *sval;
-            } else {
-                wrk.bnd[js] = T::from_f64(f64::MAX).unwrap() * T::from_f64(0.1).unwrap();
-            }
+    let results: Vec<(usize, T)> = (0..d)
+        .into_par_iter()
+        .map(|i| {
+            let vt_offset = i * Vt.cols;
+            let vt_vec = &Vt.value[vt_offset..vt_offset + Vt.cols];
+            let tmp_vec = &ab_products[i];
 
-            // Multiply by matrix A to get (scaled) left s-vector
-            A.svd_opa(vt_vec, ut_vec, wrk.transposed);
+            // Compute singular value
+            let t = svd_ddot(vt_vec, tmp_vec);
+            let sval = t.max(T::zero()).sqrt();
 
-            // Safe scaling - avoid division by very small numbers
-            if *sval > adaptive_eps {
-                svd_dscal(T::one() / *sval, ut_vec);
-            } else {
-                // For extremely small singular values, use a bounded scaling factor
-                let dls = sval.max(adaptive_eps);
-                let safe_scale = T::one() / dls;
-                svd_dscal(safe_scale, ut_vec);
-            }
+            (i, sval)
+        })
+        .collect();
+
+    // Process results and scale the vectors
+    for (i, sval) in results {
+        S[i] = sval;
+        let ut_offset = i * Ut.cols;
+        let mut ut_vec = a_products[i].clone();
+
+        // Safe scaling - avoid division by very small numbers
+        if sval > adaptive_eps {
+            svd_dscal(T::one() / sval, &mut ut_vec);
         } else {
-            // For effectively zero singular values, just use the right vector
-            // but scale it reasonably
-            A.svd_opa(vt_vec, ut_vec, wrk.transposed);
-            let norm = svd_norm(ut_vec);
-            if norm > adaptive_eps {
-                svd_dscal(T::one() / norm, ut_vec);
-            }
-            wrk.bnd[js] = T::from_f64(f64::MAX).unwrap() * T::from_f64(0.01).unwrap();
+            // For extremely small singular values, use a bounded scaling factor
+            let dls = sval.max(adaptive_eps);
+            let safe_scale = T::one() / dls;
+            svd_dscal(safe_scale, &mut ut_vec);
         }
+
+        // Copy to output
+        Ut.value[ut_offset..ut_offset + Ut.cols].copy_from_slice(&ut_vec);
     }
 
     Ok(SVDRawRec {
         // Dimensionality (rank)
         d,
-
         // Significant values
         nsig,
-
         // DMat Ut  Transpose of left singular vectors. (d by m)
         //          The vectors are the rows of Ut.
         Ut,
-
         // Array of singular values. (length d)
         S,
-
         // DMat Vt  Transpose of right singular vectors. (d by n)
         //          The vectors are the rows of Vt.
         Vt,

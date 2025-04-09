@@ -2,6 +2,7 @@ pub mod legacy;
 pub mod error;
 mod new;
 mod masked;
+pub(crate) mod utils;
 
 pub use new::*;
 pub use masked::*;
@@ -155,7 +156,7 @@ mod simple_comparison_tests {
     fn test_real_sparse_matrix() {
         // Create a matrix with similar sparsity to your real one (99.02%)
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
-
+        
         // Should no longer fail with convergence error
         let result = svd_dim_seed(&test_matrix, 50, 42); // Using your modified imtqlb
         assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
