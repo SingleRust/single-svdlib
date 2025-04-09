@@ -4,6 +4,8 @@ mod new;
 mod masked;
 pub(crate) mod utils;
 
+pub mod randomized;
+
 pub use new::*;
 pub use masked::*;
 
