@@ -1,22 +1,21 @@
-use rayon::iter::ParallelIterator;
 use crate::error::SvdLibError;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
 use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use nshare::IntoNdarray2;
 use rand::prelude::{Distribution, StdRng};
 use rand::SeedableRng;
 use rand_distr::Normal;
-use std::ops::Mul;
-use rayon::current_num_threads;
+use rayon::iter::ParallelIterator;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator};
+use std::ops::Mul;
+use crate::utils::determine_chunk_size;
 
 pub enum PowerIterationNormalizer {
     QR,
     LU,
     None,
 }
-
 
 const PARALLEL_THRESHOLD_ROWS: usize = 5000;
 const PARALLEL_THRESHOLD_COLS: usize = 1000;
@@ -35,22 +34,30 @@ where
     M: SMat<T>,
     T: ComplexField,
 {
+    let start = std::time::Instant::now(); // only for debugging
     let m_rows = m.nrows();
     let m_cols = m.ncols();
 
     let rank = target_rank.min(m_rows.min(m_cols));
     let l = rank + n_oversamples;
+    println!("Basic statistics: {:?}", start.elapsed());
 
     let omega = generate_random_matrix(m_cols, l, seed);
+    println!("Generated Random Matrix here: {:?}", start.elapsed());
 
     let mut y = DMatrix::<T>::zeros(m_rows, l);
     multiply_matrix(m, &omega, &mut y, false);
+    println!(
+        "First multiplication took: {:?}, Continuing for power iterations:",
+        start.elapsed()
+    );
 
     if n_power_iters > 0 {
         let mut z = DMatrix::<T>::zeros(m_cols, l);
 
-        for _ in 0..n_power_iters {
+        for w in 0..n_power_iters {
             multiply_matrix(m, &y, &mut z, true);
+            println!("{}-nd power-iteration forward: {:?}", w, start.elapsed());
             match power_iteration_normalizer {
                 PowerIterationNormalizer::QR => {
                     let qr = z.qr();
@@ -61,8 +68,14 @@ where
                 }
                 PowerIterationNormalizer::None => {}
             }
+            println!(
+                "{}-nd power-iteration forward, normalization: {:?}",
+                w,
+                start.elapsed()
+            );
 
             multiply_matrix(m, &z, &mut y, false);
+            println!("{}-nd power-iteration backward: {:?}", w, start.elapsed());
             match power_iteration_normalizer {
                 PowerIterationNormalizer::QR => {
                     let qr = y.qr();
@@ -71,16 +84,30 @@ where
                 PowerIterationNormalizer::LU => normalize_columns(&mut y),
                 PowerIterationNormalizer::None => {}
             }
+            println!(
+                "{}-nd power-iteration backward, normalization: {:?}",
+                w,
+                start.elapsed()
+            );
         }
     }
-
+    println!(
+        "Finished power-iteration, continuing QR: {:?}",
+        start.elapsed()
+    );
     let qr = y.qr();
+    println!("QR finished: {:?}", start.elapsed());
     let q = qr.q();
 
     let mut b = DMatrix::<T>::zeros(q.ncols(), m_cols);
     multiply_transposed_by_matrix(&q, m, &mut b);
+    println!(
+        "QMB matrix multiplication transposed: {:?}",
+        start.elapsed()
+    );
 
     let svd = b.svd(true, true);
+    println!("SVD decomposition took: {:?}", start.elapsed());
     let u_b = svd
         .u
         .ok_or_else(|| SvdLibError::Las2Error("SVD U computation failed".to_string()))?;
@@ -98,10 +125,15 @@ where
 
     // Convert to the format required by SvdRec
     let d = actual_rank;
+    println!("SVD Result Cropping: {:?}", start.elapsed());
 
     let ut = u.transpose().into_ndarray2();
-    let s = convert_singular_values(<DVector<T>>::from(singular_values.rows(0, actual_rank)), actual_rank);
+    let s = convert_singular_values(
+        <DVector<T>>::from(singular_values.rows(0, actual_rank)),
+        actual_rank,
+    );
     let vt = vt_subset.into_ndarray2();
+    println!("Translation to ndarray: {:?}", start.elapsed());
 
     Ok(SvdRec {
         d,
@@ -203,60 +235,32 @@ fn normalize_columns<T: SvdFloat + RealField + Send + Sync>(matrix: &mut DMatrix
         .collect();
 
     // Apply normalization
-    scales
-        .iter()
-        .for_each(|(j, scale)| {
-            for i in 0..rows {
-                let value = matrix.get_mut((i,*j)).unwrap();
-                *value = value.clone() * scale.clone();
-            }
-        });
+    scales.iter().for_each(|(j, scale)| {
+        for i in 0..rows {
+            let value = matrix.get_mut((i, *j)).unwrap();
+            *value = value.clone() * scale.clone();
+        }
+    });
 }
 
 // ----------------------------------------
 // Utils Functions
 // ----------------------------------------
 
-
 fn generate_random_matrix<T: SvdFloat + RealField>(
     rows: usize,
     cols: usize,
     seed: Option<u64>,
 ) -> DMatrix<T> {
-    //if rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS && rows * cols < PARALLEL_THRESHOLD_ELEMENTS {
-        let mut rng = match seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::seed_from_u64(0),
-        };
+    let mut rng = match seed {
+        Some(s) => StdRng::seed_from_u64(s),
+        None => StdRng::seed_from_u64(0),
+    };
 
-        let normal = Normal::new(0.0, 1.0).unwrap();
-        return DMatrix::from_fn(rows, cols, |_, _| {
-            T::from_f64(normal.sample(&mut rng)).unwrap()
-        });
-    //}
-
-    /*let seed_value = seed.unwrap_or(0);
-    let mut matrix = DMatrix::<T>::zeros(rows, cols);
-    let num_threads = current_num_threads();
-    let chunk_size = (rows * cols + num_threads - 1) / num_threads;
-
-    (0..(rows * cols)).into_par_iter()
-        .chunks(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, indices)| {
-            let thread_seed = seed_value.wrapping_add(chunk_idx as u64);
-            let mut rng = StdRng::seed_from_u64(thread_seed);
-            let normal = Normal::new(0.0, 1.0).unwrap();
-            for idx in indices {
-                let i = idx / cols;
-                let j = idx % cols;
-                unsafe {
-                    *matrix.get_unchecked_mut((i, j)) = T::from_f64(normal.sample(&mut rng)).unwrap();
-                }
-            }
-        });
-    matrix*/
-
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    DMatrix::from_fn(rows, cols, |_, _| {
+        T::from_f64(normal.sample(&mut rng)).unwrap()
+    })
 }
 
 fn multiply_matrix<T: SvdFloat, M: SMat<T>>(
@@ -266,53 +270,94 @@ fn multiply_matrix<T: SvdFloat, M: SMat<T>>(
     transpose_sparse: bool,
 ) {
     let cols = dense.ncols();
-    //let matrix_rows = if transpose_sparse { sparse.ncols() } else { sparse.nrows() };
 
-    //if matrix_rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS {
-        let mut col_vec = vec![T::zero(); dense.nrows()];
-        let mut result_vec = vec![T::zero(); result.nrows()];
+    let results: Vec<(usize, Vec<T>)> = (0..cols)
+        .into_par_iter()
+        .map(|j| {
+            let mut col_vec = vec![T::zero(); dense.nrows()];
+            let mut result_vec = vec![T::zero(); result.nrows()];
 
-        for j in 0..cols {
-            // Extract column from dense matrix
             for i in 0..dense.nrows() {
                 col_vec[i] = dense[(i, j)];
             }
 
-            // Perform sparse matrix operation
             sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
 
-            // Store results
-            for i in 0..result.nrows() {
-                result[(i, j)] = result_vec[i];
-            }
+            (j, result_vec)
+        })
+        .collect();
 
-            // Clear result vector for reuse
-            result_vec.iter_mut().for_each(|v| *v = T::zero());
+    for (j, col_result) in results {
+        for i in 0..result.nrows() {
+            result[(i, j)] = col_result[i];
         }
-        return;
-    //}
-
-
+    }
 }
 
 fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T>>(
-    q: &DMatrix<T>,
+    q: &DMatrix<T>, 
     sparse: &M,
     result: &mut DMatrix<T>,
 ) {
-    for j in 0..sparse.ncols() {
-        let mut unit_vec = vec![T::zero(); sparse.ncols()];
-        unit_vec[j] = T::one();
-
-        let mut col_vec = vec![T::zero(); sparse.nrows()];
-        sparse.svd_opa(&unit_vec, &mut col_vec, false);
-
-        for i in 0..q.ncols() {
-            let mut sum = T::zero();
-            for k in 0..q.nrows() {
-                sum += q[(k, i)] * col_vec[k];
+    let q_rows = q.nrows();
+    let q_cols = q.ncols();
+    let sparse_rows = sparse.nrows();
+    let sparse_cols = sparse.ncols();
+    
+    eprintln!("Q dimensions: {} x {}", q_rows, q_cols);
+    eprintln!("Sparse dimensions: {} x {}", sparse_rows, sparse_cols);
+    eprintln!("Result dimensions: {} x {}", result.nrows(), result.ncols());
+    
+    assert_eq!(
+        q_rows, sparse_rows,
+        "Dimension mismatch: Q has {} rows but sparse has {} rows",
+        q_rows, sparse_rows
+    );
+    
+    assert_eq!(
+        result.nrows(),
+        q_cols,
+        "Result matrix has incorrect row count: expected {}, got {}",
+        q_cols,
+        result.nrows()
+    );
+    assert_eq!(
+        result.ncols(),
+        sparse_cols,
+        "Result matrix has incorrect column count: expected {}, got {}",
+        sparse_cols,
+        result.ncols()
+    );
+    
+    let chunk_size = determine_chunk_size(q_cols);
+    
+    let chunk_results: Vec<Vec<(usize, Vec<T>)>> = (0..q_cols)
+        .into_par_iter()
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let mut chunk_results = Vec::with_capacity(chunk.len());
+            
+            for &col_idx in &chunk {
+                let mut q_col = vec![T::zero(); q_rows];
+                for i in 0..q_rows {
+                    q_col[i] = q[(i, col_idx)];
+                }
+                
+                let mut result_row = vec![T::zero(); sparse_cols];
+                
+                sparse.svd_opa(&q_col, &mut result_row, true);
+                
+                chunk_results.push((col_idx, result_row));
             }
-            result[(i, j)] = sum;
+            chunk_results
+        })
+        .collect();
+    
+    for chunk_result in chunk_results {
+        for (row_idx, row_values) in chunk_result {
+            for j in 0..sparse_cols {
+                result[(row_idx, j)] = row_values[j];
+            }
         }
     }
 }

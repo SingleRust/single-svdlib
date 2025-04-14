@@ -226,11 +226,43 @@ mod simple_comparison_tests {
 
         // Convert to CSR for processing
         let csr = CsrMatrix::from(&test_matrix);
-
+    
         // Run randomized SVD with reasonable defaults for a sparse matrix
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
              randomized_svd(
+                &csr,
+                50,                              // target rank
+                10,                              // oversampling parameter
+                2,                               // power iterations
+                PowerIterationNormalizer::QR,    // use QR normalization
+                Some(42),                        // random seed
+            )
+        });
+
+
+        // Simply verify that the computation succeeds on a highly sparse matrix
+        assert!(
+            result.is_ok(),
+            "Randomized SVD failed on 99% sparse matrix: {:?}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_randomized_svd_small_sparse_matrix() {
+        use crate::{randomized_svd, PowerIterationNormalizer};
+
+        // Create a very large matrix with high sparsity (99%)
+        let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
+
+        // Convert to CSR for processing
+        let csr = CsrMatrix::from(&test_matrix);
+
+        // Run randomized SVD with reasonable defaults for a sparse matrix
+        let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
+        let result = threadpool.install(|| {
+            randomized_svd(
                 &csr,
                 50,                              // target rank
                 10,                              // oversampling parameter
