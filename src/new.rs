@@ -1157,7 +1157,7 @@ fn ritvec<T: SvdFloat>(
 
     let sparsity = T::one()
         - (T::from_usize(A.nnz()).unwrap()
-        / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
+            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
 
     let epsilon = T::epsilon();
     let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
@@ -1322,7 +1322,7 @@ fn ritvec<T: SvdFloat>(
         S[i] = sval;
         let ut_offset = i * Ut.cols;
         let mut ut_vec = a_products[i].clone();
-        
+
         if sval > adaptive_eps {
             svd_dscal(T::one() / sval, &mut ut_vec);
         } else {
@@ -1541,7 +1541,7 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
 }
 
 #[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
+impl<T: Float + Zero + AddAssign + Clone + Sync + Send> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
     fn nnz(&self) -> usize { self.nnz() }
@@ -1556,22 +1556,59 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
 
         let (major_offsets, minor_indices, values) = self.csr_data();
 
-        for y_val in y.iter_mut() {
-            *y_val = T::zero();
-        }
+        y.fill(T::zero());
 
         if !transposed {
-            for (i, yval) in y.iter_mut().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    *yval += values[j] * x[minor_indices[j]];
-                }
+            let nrows = self.nrows();
+            let chunk_size = crate::utils::determine_chunk_size(nrows);
+
+            // Create thread-local vectors with results
+            let results: Vec<(usize, T)> = (0..nrows)
+                .into_par_iter()
+                .map(|i| {
+                    let mut sum = T::zero();
+                    for j in major_offsets[i]..major_offsets[i + 1] {
+                        sum += values[j] * x[minor_indices[j]];
+                    }
+                (i, sum)
+            })
+            .collect();
+
+            // Apply the results to y
+            for (i, val) in results {
+                y[i] = val;
             }
         } else {
-            for (i, xval) in x.iter().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    y[minor_indices[j]] += values[j] * *xval;
+            let nrows = self.nrows();
+        let chunk_size = crate::utils::determine_chunk_size(nrows);
+
+        // Process input in chunks and create partial results
+        let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nrows);
+
+                let mut local_y = vec![T::zero(); y.len()];
+                for i in start..end {
+                    let row_val = x[i];
+                    for j in major_offsets[i]..major_offsets[i + 1] {
+                        let col = minor_indices[j];
+                        local_y[col] += values[j] * row_val;
+                    }
+                }
+                local_y
+            })
+            .collect();
+
+        // Combine partial results
+        for local_y in results {
+            for (idx, val) in local_y.iter().enumerate() {
+                if !val.is_zero() {
+                    y[idx] += *val;
                 }
             }
+        }
         }
     }
 }

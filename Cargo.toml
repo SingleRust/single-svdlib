@@ -9,10 +9,14 @@ edition = "2021"
 license-file = "SVDLIBC-LICENSE.txt"
 
 [dependencies]
+anyhow = "1.0.97"
+argmin = { version = "0.10.0", features = ["rayon"] }
 nalgebra-sparse = "0.10.0"
-ndarray = "0.16.1"
 num-traits = "0.2.19"
 rand = "0.9.0"
 rand_distr = "0.5.1"
 rayon = "1.10.0"
 thiserror = "2.0.9"
+nshare = {version = "0.10.0", features = ["nalgebra", "ndarray"] }
+ndarray = "0.16.1"
+nalgebra = { version = "0.33.2", features = ["rayon"] }

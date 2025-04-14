@@ -1,593 +1,318 @@
+use rayon::iter::ParallelIterator;
 use crate::error::SvdLibError;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
-use ndarray::{s, Array, Array1, Array2, Axis};
-use num_traits::Float;
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::cmp::min;
+use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
+use ndarray::{Array1, Array2};
+use nshare::IntoNdarray2;
+use rand::prelude::{Distribution, StdRng};
+use rand::SeedableRng;
+use rand_distr::Normal;
+use std::ops::Mul;
+use rayon::current_num_threads;
+use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator};
 
-/// Computes a randomized SVD with default parameters
-///
-/// # Parameters
-/// - A: Sparse matrix
-/// - rank: Number of singular values/vectors to compute
-///
-/// # Returns
-/// - SvdRec: Singular value decomposition (U, S, V)
-pub fn randomized_svd<T, M>(a: &M, rank: usize) -> Result<SvdRec<T>, SvdLibError>
-where
-    T: SvdFloat,
-    M: SMat<T>,
-{
-    let oversampling = 10;
-    let n_power_iterations = 2;
-    let random_seed = 0; // Will be generated randomly
-    randomized_svd_full(a, rank, oversampling, n_power_iterations, random_seed)
+pub enum PowerIterationNormalizer {
+    QR,
+    LU,
+    None,
 }
 
-/// Computes a randomized SVD with control over oversampling and power iterations
-///
-/// # Parameters
-/// - A: Sparse matrix
-/// - rank: Number of singular values/vectors to compute
-/// - oversampling: Additional columns to sample for improved accuracy (typically 5-10)
-/// - n_power_iterations: Number of power iterations to enhance accuracy for smaller singular values
-///
-/// # Returns
-/// - SvdRec: Singular value decomposition (U, S, V)
-pub fn randomized_svd_with_params<T, M>(
-    a: &M,
-    rank: usize,
-    oversampling: usize,
-    n_power_iterations: usize,
-) -> Result<SvdRec<T>, SvdLibError>
+
+const PARALLEL_THRESHOLD_ROWS: usize = 5000;
+const PARALLEL_THRESHOLD_COLS: usize = 1000;
+const PARALLEL_THRESHOLD_ELEMENTS: usize = 100_000;
+
+pub fn randomized_svd<T, M>(
+    m: &M,
+    target_rank: usize,
+    n_oversamples: usize,
+    n_power_iters: usize,
+    power_iteration_normalizer: PowerIterationNormalizer,
+    seed: Option<u64>,
+) -> anyhow::Result<SvdRec<T>>
 where
-    T: SvdFloat,
+    T: SvdFloat + RealField,
     M: SMat<T>,
+    T: ComplexField,
 {
-    randomized_svd_full(a, rank, oversampling, n_power_iterations, 0)
-}
+    let m_rows = m.nrows();
+    let m_cols = m.ncols();
 
-/// Computes a randomized SVD with full parameter control
-///
-/// # Parameters
-/// - A: Sparse matrix
-/// - rank: Number of singular values/vectors to compute
-/// - oversampling: Additional columns to sample for improved accuracy
-/// - n_power_iterations: Number of power iterations to enhance accuracy for smaller singular values
-/// - random_seed: Seed for random number generation (0 for random seed)
-///
-/// # Returns
-/// - SvdRec: Singular value decomposition (U, S, V)
-pub fn randomized_svd_full<T, M>(
-    a: &M,
-    rank: usize,
-    oversampling: usize,
-    n_power_iterations: usize,
-    random_seed: u32,
-) -> Result<SvdRec<T>, SvdLibError>
-where
-    T: SvdFloat,
-    M: SMat<T>,
-{
-    // Determine the actual seed to use
-    let seed = if random_seed == 0 {
-        // Use the system time as a seed if none is provided
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        duration.as_nanos() as u32
-    } else {
-        random_seed
-    };
+    let rank = target_rank.min(m_rows.min(m_cols));
+    let l = rank + n_oversamples;
 
-    // Validate parameters
-    let nrows = a.nrows();
-    let ncols = a.ncols();
-    let min_dim = min(nrows, ncols);
+    let omega = generate_random_matrix(m_cols, l, seed);
 
-    if rank == 0 {
-        return Err(SvdLibError::Las2Error(
-            "Rank must be greater than 0".to_string(),
-        ));
-    }
+    let mut y = DMatrix::<T>::zeros(m_rows, l);
+    multiply_matrix(m, &omega, &mut y, false);
 
-    if rank > min_dim {
-        return Err(SvdLibError::Las2Error(format!(
-            "Requested rank {} exceeds matrix dimensions {}x{}",
-            rank, nrows, ncols
-        )));
-    }
+    if n_power_iters > 0 {
+        let mut z = DMatrix::<T>::zeros(m_cols, l);
 
-    // The target rank with oversampling (can't exceed matrix dimensions)
-    let target_rank = min(rank + oversampling, min_dim);
+        for _ in 0..n_power_iters {
+            multiply_matrix(m, &y, &mut z, true);
+            match power_iteration_normalizer {
+                PowerIterationNormalizer::QR => {
+                    let qr = z.qr();
+                    z = qr.q();
+                }
+                PowerIterationNormalizer::LU => {
+                    normalize_columns(&mut z);
+                }
+                PowerIterationNormalizer::None => {}
+            }
 
-    // Transpose large matrices for efficiency if needed
-    let transposed = ncols > nrows;
-    let (work_rows, work_cols) = if transposed {
-        (ncols, nrows)
-    } else {
-        (nrows, ncols)
-    };
-
-    // Stage 1: Generate a random projection matrix Omega
-    let omega = generate_random_matrix(work_cols, target_rank, seed)?;
-
-    // Stage 2: Form Y = A * Omega (or Y = A^T * Omega if transposed)
-    let mut y = Array2::zeros((work_rows, target_rank));
-
-    // Fill Y by matrix-vector products
-    for j in 0..target_rank {
-        let omega_col = omega.slice(s![.., j]).to_vec();
-        let mut y_col = vec![T::zero(); work_rows];
-
-        // Apply A or A^T
-        a.svd_opa(&omega_col, &mut y_col, transposed);
-
-        // Copy result to column of Y
-        for i in 0..work_rows {
-            y[[i, j]] = y_col[i];
+            multiply_matrix(m, &z, &mut y, false);
+            match power_iteration_normalizer {
+                PowerIterationNormalizer::QR => {
+                    let qr = y.qr();
+                    y = qr.q();
+                }
+                PowerIterationNormalizer::LU => normalize_columns(&mut y),
+                PowerIterationNormalizer::None => {}
+            }
         }
     }
 
-    // Stage 3: Power iteration scheme to increase accuracy for smaller singular values
-    if n_power_iterations > 0 {
-        // Compute power iterations (Y = (A*A^T)^q * Y)
-        y = power_iteration(a, y, n_power_iterations, transposed)?;
-    }
+    let qr = y.qr();
+    let q = qr.q();
 
-    // Stage 4: Orthogonalize the basis using QR decomposition
-    let q = orthogonalize(y)?;
+    let mut b = DMatrix::<T>::zeros(q.ncols(), m_cols);
+    multiply_transposed_by_matrix(&q, m, &mut b);
 
-    // Stage 5: Form B = Q^T * A (or B = Q^T * A^T if transposed)
-    let mut b = Array2::zeros((target_rank, work_cols));
+    let svd = b.svd(true, true);
+    let u_b = svd
+        .u
+        .ok_or_else(|| SvdLibError::Las2Error("SVD U computation failed".to_string()))?;
+    let singular_values = svd.singular_values;
+    let vt = svd
+        .v_t
+        .ok_or_else(|| SvdLibError::Las2Error("SVD V_t computation failed".to_string()))?;
 
-    // Fill B by matrix-vector products
-    for i in 0..work_cols {
-        let mut e_i = vec![T::zero(); work_cols];
-        e_i[i] = T::one();
+    let actual_rank = target_rank.min(singular_values.len());
 
-        let mut b_row = vec![T::zero(); target_rank];
+    let u_b_subset = u_b.columns(0, actual_rank);
+    let u = q.mul(&u_b_subset);
 
-        // Apply A or A^T
-        a.svd_opa(&e_i, &mut b_row, !transposed);
+    let vt_subset = vt.rows(0, actual_rank).into_owned();
 
-        // Apply Q^T
-        let qt_b = matrix_vector_multiply(&q, &b_row, true);
+    // Convert to the format required by SvdRec
+    let d = actual_rank;
 
-        // Copy result to row of B
-        for j in 0..target_rank {
-            b[[j, i]] = qt_b[j];
-        }
-    }
+    let ut = u.transpose().into_ndarray2();
+    let s = convert_singular_values(<DVector<T>>::from(singular_values.rows(0, actual_rank)), actual_rank);
+    let vt = vt_subset.into_ndarray2();
 
-    // Stage 6: Compute the SVD of B
-    let (u_b, s_b, v_b) = compute_svd_dense(b, rank)?;
-
-    // Stage 7: Form the SVD of A
-    let u_a = if transposed {
-        v_b
-    } else {
-        matrix_multiply(&q, &u_b)
-    };
-
-    let v_a = if transposed {
-        matrix_multiply(&q, &u_b)
-    } else {
-        v_b
-    };
-
-    // Return the SVD in the requested format
     Ok(SvdRec {
-        d: rank,
-        ut: if transposed { v_a } else { u_a.t().to_owned() },
-        s: s_b,
-        vt: if transposed { u_a.t().to_owned() } else { v_a },
-        diagnostics: Diagnostics {
-            non_zero: a.nnz(),
-            dimensions: rank,
-            iterations: n_power_iterations,
-            transposed,
-            lanczos_steps: 0, // Not applicable for randomized SVD
-            ritz_values_stabilized: 0, // Not applicable
-            significant_values: rank,
-            singular_values: rank,
-            end_interval: [T::zero(), T::zero()], // Not applicable
-            kappa: T::from_f64(1e-6).unwrap(), // Standard value
-            random_seed: seed,
-        },
+        d,
+        ut,
+        s,
+        vt,
+        diagnostics: create_diagnostics(m, d, target_rank, n_power_iters, seed.unwrap_or(0) as u32),
     })
 }
 
-// Helper functions (implementations to be added)
+fn convert_singular_values<T: SvdFloat + ComplexField>(
+    values: DVector<T::RealField>,
+    size: usize,
+) -> Array1<T> {
+    let mut array = Array1::zeros(size);
 
-fn generate_random_matrix<T: SvdFloat>(
-    n_rows: usize,
-    n_cols: usize,
-    seed: u32,
-) -> Result<Array2<T>, SvdLibError> {
-    // Create a Gaussian random matrix
-    let mut rng = StdRng::seed_from_u64(seed as u64);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    for i in 0..size {
+        // Convert from RealField to T using f64 as intermediate
+        array[i] = T::from_real(values[i].clone());
+    }
 
-    let mut omega = Array2::zeros((n_rows, n_cols));
-
-    // Fill with random normal values
-    omega.par_iter_mut().for_each(|x| {
-        // Using local RNG for each parallel task
-        let mut local_rng = StdRng::from_entropy();
-        *x = T::from_f64(normal.sample(&mut local_rng)).unwrap();
-    });
-
-    Ok(omega)
+    array
 }
 
-fn power_iteration<T, M>(
+fn create_diagnostics<T, M: SMat<T>>(
     a: &M,
-    mut y: Array2<T>,
-    n_iterations: usize,
-    transposed: bool,
-) -> Result<Array2<T>, SvdLibError>
+    d: usize,
+    target_rank: usize,
+    power_iterations: usize,
+    seed: u32,
+) -> Diagnostics<T>
 where
     T: SvdFloat,
-    M: SMat<T>,
 {
-    let (n_rows, n_cols) = y.dim();
-
-    // Temporary arrays for matrix operations
-    let mut temp_rows = vec![T::zero(); a.nrows()];
-    let mut temp_cols = vec![T::zero(); a.ncols()];
-
-    for _ in 0..n_iterations {
-        // Apply (A*A^T) to Y through two matrix-vector products
-        for j in 0..n_cols {
-            let y_col = y.slice(s![.., j]).to_vec();
-
-            // First multiply: temp = A^T * y_col (or A * y_col if transposed)
-            a.svd_opa(&y_col, &mut temp_cols, !transposed);
-
-            // Second multiply: y_col = A * temp (or A^T * temp if transposed)
-            a.svd_opa(&temp_cols, &mut temp_rows, transposed);
-
-            // Update Y
-            for i in 0..n_rows {
-                y[[i, j]] = temp_rows[i];
-            }
-        }
-
-        // Orthogonalize after each iteration for numerical stability
-        y = orthogonalize(y)?;
+    Diagnostics {
+        non_zero: a.nnz(),
+        dimensions: target_rank,
+        iterations: power_iterations,
+        transposed: false,
+        lanczos_steps: 0, // we dont do that
+        ritz_values_stabilized: d,
+        significant_values: d,
+        singular_values: d,
+        end_interval: [T::from(-1e-30).unwrap(), T::from(1e-30).unwrap()],
+        kappa: T::from(1e-6).unwrap(),
+        random_seed: seed,
     }
-
-    Ok(y)
 }
 
-fn orthogonalize<T: SvdFloat>(a: Array2<T>) -> Result<Array2<T>, SvdLibError> {
-    // Implement a modified Gram-Schmidt orthogonalization
-    // This is more numerically stable than the standard Gram-Schmidt process
-    let (n_rows, n_cols) = a.dim();
-    let mut q = a.clone();
+fn normalize_columns<T: SvdFloat + RealField + Send + Sync>(matrix: &mut DMatrix<T>) {
+    let rows = matrix.nrows();
+    let cols = matrix.ncols();
 
-    for j in 0..n_cols {
-        // Normalize the j-th column
-        let mut norm_squared = T::zero();
-        for i in 0..n_rows {
-            norm_squared += q[[i, j]] * q[[i, j]];
+    // Use sequential processing for small matrices
+    if rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS {
+        for j in 0..cols {
+            let mut norm = T::zero();
+
+            // Calculate column norm
+            for i in 0..rows {
+                norm += ComplexField::powi(matrix[(i, j)], 2);
+            }
+            norm = ComplexField::sqrt(norm);
+
+            // Normalize the column if the norm is not too small
+            if norm > T::from_f64(1e-10).unwrap() {
+                let scale = T::one() / norm;
+                for i in 0..rows {
+                    matrix[(i, j)] *= scale;
+                }
+            }
         }
+        return;
+    }
 
-        let norm = norm_squared.sqrt();
+    let norms: Vec<T> = (0..cols)
+        .into_par_iter()
+        .map(|j| {
+            let mut norm = T::zero();
+            for i in 0..rows {
+                let val = unsafe { *matrix.get_unchecked((i, j)) };
+                norm += ComplexField::powi(val, 2);
+            }
+            ComplexField::sqrt(norm)
+        })
+        .collect();
 
-        // Handle near-zero columns
-        if norm <= T::from_f64(1e-10).unwrap() {
-            // If column is essentially zero, replace with random vector
-            let mut rng = StdRng::from_entropy();
+    // Now create a vector of (column_index, scale) pairs
+    let scales: Vec<(usize, T)> = norms
+        .into_iter()
+        .enumerate()
+        .filter_map(|(j, norm)| {
+            if norm > T::from_f64(1e-10).unwrap() {
+                Some((j, T::one() / norm))
+            } else {
+                None // Skip columns with too small norms
+            }
+        })
+        .collect();
+
+    // Apply normalization
+    scales
+        .iter()
+        .for_each(|(j, scale)| {
+            for i in 0..rows {
+                let value = matrix.get_mut((i,*j)).unwrap();
+                *value = value.clone() * scale.clone();
+            }
+        });
+}
+
+// ----------------------------------------
+// Utils Functions
+// ----------------------------------------
+
+
+fn generate_random_matrix<T: SvdFloat + RealField>(
+    rows: usize,
+    cols: usize,
+    seed: Option<u64>,
+) -> DMatrix<T> {
+    //if rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS && rows * cols < PARALLEL_THRESHOLD_ELEMENTS {
+        let mut rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::seed_from_u64(0),
+        };
+
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        return DMatrix::from_fn(rows, cols, |_, _| {
+            T::from_f64(normal.sample(&mut rng)).unwrap()
+        });
+    //}
+
+    /*let seed_value = seed.unwrap_or(0);
+    let mut matrix = DMatrix::<T>::zeros(rows, cols);
+    let num_threads = current_num_threads();
+    let chunk_size = (rows * cols + num_threads - 1) / num_threads;
+
+    (0..(rows * cols)).into_par_iter()
+        .chunks(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, indices)| {
+            let thread_seed = seed_value.wrapping_add(chunk_idx as u64);
+            let mut rng = StdRng::seed_from_u64(thread_seed);
             let normal = Normal::new(0.0, 1.0).unwrap();
-
-            for i in 0..n_rows {
-                q[[i, j]] = T::from_f64(normal.sample(&mut rng)).unwrap();
-            }
-
-            // Recursively orthogonalize this column against previous columns
-            for k in 0..j {
-                let mut dot = T::zero();
-                for i in 0..n_rows {
-                    dot += q[[i, j]] * q[[i, k]];
-                }
-
-                for i in 0..n_rows {
-                    q[[i, j]] -= dot * q[[i, k]];
+            for idx in indices {
+                let i = idx / cols;
+                let j = idx % cols;
+                unsafe {
+                    *matrix.get_unchecked_mut((i, j)) = T::from_f64(normal.sample(&mut rng)).unwrap();
                 }
             }
+        });
+    matrix*/
 
-            // Normalize again
-            norm_squared = T::zero();
-            for i in 0..n_rows {
-                norm_squared += q[[i, j]] * q[[i, j]];
-            }
-            let norm = norm_squared.sqrt();
-
-            for i in 0..n_rows {
-                q[[i, j]] /= norm;
-            }
-        } else {
-            // Normalize the column
-            for i in 0..n_rows {
-                q[[i, j]] /= norm;
-            }
-
-            // Orthogonalize remaining columns against this one
-            for k in (j+1)..n_cols {
-                let mut dot = T::zero();
-                for i in 0..n_rows {
-                    dot += q[[i, j]] * q[[i, k]];
-                }
-
-                for i in 0..n_rows {
-                    q[[i, k]] -= dot * q[[i, j]];
-                }
-            }
-        }
-    }
-
-    Ok(q)
 }
 
-fn matrix_vector_multiply<T: SvdFloat>(
-    a: &Array2<T>,
-    x: &[T],
-    transpose: bool,
-) -> Vec<T> {
-    let (n_rows, n_cols) = a.dim();
+fn multiply_matrix<T: SvdFloat, M: SMat<T>>(
+    sparse: &M,
+    dense: &DMatrix<T>,
+    result: &mut DMatrix<T>,
+    transpose_sparse: bool,
+) {
+    let cols = dense.ncols();
+    //let matrix_rows = if transpose_sparse { sparse.ncols() } else { sparse.nrows() };
 
-    if !transpose {
-        // y = A * x
-        assert_eq!(x.len(), n_cols, "Vector length must match number of columns");
+    //if matrix_rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS {
+        let mut col_vec = vec![T::zero(); dense.nrows()];
+        let mut result_vec = vec![T::zero(); result.nrows()];
 
-        let mut y = vec![T::zero(); n_rows];
-
-        if n_rows > 1000 {
-            // Parallel implementation for large matrices
-            y.par_iter_mut().enumerate().for_each(|(i, y_i)| {
-                let row = a.row(i);
-                *y_i = row.iter().zip(x.iter()).map(|(&a_ij, &x_j)| a_ij * x_j).sum();
-            });
-        } else {
-            // Sequential for smaller matrices to avoid parallel overhead
-            for i in 0..n_rows {
-                let row = a.row(i);
-                y[i] = row.iter().zip(x.iter()).map(|(&a_ij, &x_j)| a_ij * x_j).sum();
+        for j in 0..cols {
+            // Extract column from dense matrix
+            for i in 0..dense.nrows() {
+                col_vec[i] = dense[(i, j)];
             }
-        }
 
-        y
-    } else {
-        // y = A^T * x
-        assert_eq!(x.len(), n_rows, "Vector length must match number of rows");
+            // Perform sparse matrix operation
+            sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
 
-        let mut y = vec![T::zero(); n_cols];
-
-        if n_cols > 1000 {
-            // Parallel implementation for large matrices
-            y.par_iter_mut().enumerate().for_each(|(j, y_j)| {
-                let col = a.column(j);
-                *y_j = col.iter().zip(x.iter()).map(|(&a_ij, &x_i)| a_ij * x_i).sum();
-            });
-        } else {
-            // Sequential for smaller matrices
-            for j in 0..n_cols {
-                let col = a.column(j);
-                y[j] = col.iter().zip(x.iter()).map(|(&a_ij, &x_i)| a_ij * x_i).sum();
+            // Store results
+            for i in 0..result.nrows() {
+                result[(i, j)] = result_vec[i];
             }
-        }
 
-        y
-    }
+            // Clear result vector for reuse
+            result_vec.iter_mut().for_each(|v| *v = T::zero());
+        }
+        return;
+    //}
+
+
 }
 
-fn matrix_multiply<T: SvdFloat>(a: &Array2<T>, b: &Array2<T>) -> Array2<T> {
-    // Basic matrix multiplication C = A * B
-    let (a_rows, a_cols) = a.dim();
-    let (b_rows, b_cols) = b.dim();
+fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T>>(
+    q: &DMatrix<T>,
+    sparse: &M,
+    result: &mut DMatrix<T>,
+) {
+    for j in 0..sparse.ncols() {
+        let mut unit_vec = vec![T::zero(); sparse.ncols()];
+        unit_vec[j] = T::one();
 
-    assert_eq!(a_cols, b_rows, "Matrix dimensions do not match for multiplication");
+        let mut col_vec = vec![T::zero(); sparse.nrows()];
+        sparse.svd_opa(&unit_vec, &mut col_vec, false);
 
-    let mut c = Array2::zeros((a_rows, b_cols));
-
-    // For large matrices, use parallel execution
-    if a_rows * b_cols > 10000 {
-        c.axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(i, mut row)| {
-                for j in 0..b_cols {
-                    let mut sum = T::zero();
-                    for k in 0..a_cols {
-                        sum += a[[i, k]] * b[[k, j]];
-                    }
-                    row[j] = sum;
-                }
-            });
-    } else {
-        // For smaller matrices, sequential is faster due to less overhead
-        for i in 0..a_rows {
-            for j in 0..b_cols {
-                let mut sum = T::zero();
-                for k in 0..a_cols {
-                    sum += a[[i, k]] * b[[k, j]];
-                }
-                c[[i, j]] = sum;
+        for i in 0..q.ncols() {
+            let mut sum = T::zero();
+            for k in 0..q.nrows() {
+                sum += q[(k, i)] * col_vec[k];
             }
+            result[(i, j)] = sum;
         }
     }
-
-    c
-}
-
-fn compute_svd_dense<T: SvdFloat>(
-    a: Array2<T>,
-    rank: usize,
-) -> Result<(Array2<T>, Array1<T>, Array2<T>), SvdLibError> {
-    // For the dense SVD computation, we'll use a simplified approach
-    // In a real implementation, you would use a high-quality SVD library
-    // such as LAPACK via ndarray-linalg or similar
-
-    let (n_rows, n_cols) = a.dim();
-
-    // Form A^T * A (or A * A^T for tall matrices)
-    let mut ata = if n_rows <= n_cols {
-        // For wide matrices, compute A^T * A (smaller)
-        let mut ata = Array2::zeros((n_cols, n_cols));
-
-        for i in 0..n_cols {
-            for j in 0..=i {
-                let mut sum = T::zero();
-                for k in 0..n_rows {
-                    sum += a[[k, i]] * a[[k, j]];
-                }
-                ata[[i, j]] = sum;
-                if i != j {
-                    ata[[j, i]] = sum; // Symmetric matrix
-                }
-            }
-        }
-        ata
-    } else {
-        // For tall matrices, compute A * A^T (smaller)
-        let mut aat = Array2::zeros((n_rows, n_rows));
-
-        for i in 0..n_rows {
-            for j in 0..=i {
-                let mut sum = T::zero();
-                for k in 0..n_cols {
-                    sum += a[[i, k]] * a[[j, k]];
-                }
-                aat[[i, j]] = sum;
-                if i != j {
-                    aat[[j, i]] = sum; // Symmetric matrix
-                }
-            }
-        }
-        aat
-    };
-
-    // Compute eigendecomposition of A^T*A or A*A^T
-    // For simplicity, we'll use a basic power iteration method
-    // In practice, use a specialized eigenvalue solver
-    let (eigvals, eigvecs) = compute_eigen_decomposition(&mut ata, rank)?;
-
-    let mut s = Array1::zeros(rank);
-    for i in 0..rank {
-        // Singular values are square roots of eigenvalues
-        s[i] = eigvals[i].abs().sqrt();
-    }
-
-    let mut v = if n_rows <= n_cols {
-        // Wide matrix case: we computed A^T*A, so eigvecs are V
-        eigvecs
-    } else {
-        // Tall matrix case: we computed A*A^T, so need to compute V = A^T*U*S^(-1)
-        let mut v = Array2::zeros((n_cols, rank));
-
-        for j in 0..rank {
-            if s[j] > T::from_f64(1e-10).unwrap() {
-                for i in 0..n_cols {
-                    let mut sum = T::zero();
-                    for k in 0..n_rows {
-                        sum += a[[k, i]] * eigvecs[[k, j]];
-                    }
-                    v[[i, j]] = sum / s[j];
-                }
-            }
-        }
-        v
-    };
-
-    let mut u = if n_rows <= n_cols {
-        // Wide matrix case: compute U = A*V*S^(-1)
-        let mut u = Array2::zeros((n_rows, rank));
-
-        for j in 0..rank {
-            if s[j] > T::from_f64(1e-10).unwrap() {
-                for i in 0..n_rows {
-                    let mut sum = T::zero();
-                    for k in 0..n_cols {
-                        sum += a[[i, k]] * v[[k, j]];
-                    }
-                    u[[i, j]] = sum / s[j];
-                }
-            }
-        }
-        u
-    } else {
-        // Tall matrix case: we computed A*A^T, so eigvecs are U
-        eigvecs
-    };
-
-    // Ensure orthogonality and normalize
-    u = orthogonalize(u)?;
-    v = orthogonalize(v)?;
-
-    Ok((u, s, v))
-}
-
-fn compute_eigen_decomposition<T: SvdFloat>(
-    a: &mut Array2<T>,
-    rank: usize,
-) -> Result<(Vec<T>, Array2<T>), SvdLibError> {
-    let n = a.dim().0;
-    let mut eigenvalues = vec![T::zero(); n];
-    let mut eigenvectors = Array2::zeros((n, n));
-
-    // Initialize eigenvectors to identity matrix
-    for i in 0..n {
-        eigenvectors[[i, i]] = T::one();
-    }
-
-    // We'll use the QR algorithm with shifts
-    // In practice, use a specialized library for this
-
-    // For simplicity, we'll just compute a few iterations of QR decomposition
-    // This is a simplified approach - real implementations would use more robust methods
-    let max_iter = 30;
-
-    for _ in 0..max_iter {
-        // For each iteration, perform a QR decomposition step
-        let q = orthogonalize(eigenvectors.clone())?;
-
-        // Compute R = Q^T * A * Q (Rayleigh quotient)
-        let r = matrix_multiply(&matrix_multiply(&q.t().to_owned(), a), &q);
-
-        // Update eigenvectors
-        eigenvectors = q;
-
-        // Update matrix for next iteration
-        *a = r;
-    }
-
-    // Extract eigenvalues from diagonal
-    for i in 0..n {
-        eigenvalues[i] = a[[i, i]];
-    }
-
-    // Sort eigenvalues and eigenvectors by decreasing eigenvalue magnitude
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&i, &j| eigenvalues[j].abs().partial_cmp(&eigenvalues[i].abs()).unwrap());
-
-    let mut sorted_values = vec![T::zero(); n];
-    let mut sorted_vectors = Array2::zeros((n, n));
-
-    for (new_idx, &old_idx) in indices.iter().enumerate() {
-        sorted_values[new_idx] = eigenvalues[old_idx];
-        for i in 0..n {
-            sorted_vectors[[i, new_idx]] = eigenvectors[[i, old_idx]];
-        }
-    }
-
-    // Return only the top 'rank' eigenvalues and eigenvectors
-    let top_values = sorted_values.into_iter().take(rank).collect();
-    let top_vectors = sorted_vectors.slice(s![.., 0..rank]).to_owned();
-
-    Ok((top_values, top_vectors))
 }
