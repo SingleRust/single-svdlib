@@ -1,14 +1,13 @@
 pub mod legacy;
 pub mod error;
-mod new;
-mod masked;
 pub(crate) mod utils;
 
-pub(crate) mod randomized;
+pub mod randomized;
 
-pub use new::*;
-pub use masked::*;
-pub use randomized::{randomized_svd, PowerIterationNormalizer};
+pub mod laczos;
+
+pub use utils::*;
+
 
 #[cfg(test)]
 mod simple_comparison_tests {
@@ -19,7 +18,6 @@ mod simple_comparison_tests {
     use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
     use rayon::ThreadPoolBuilder;
-    use crate::randomized::randomized_svd;
 
     fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> nalgebra_sparse::coo::CooMatrix<f64> {
         use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -77,7 +75,7 @@ mod simple_comparison_tests {
 
         // Run both implementations with the same seed for deterministic behavior
         let seed = 42;
-        let current_result = svd_dim_seed(&test_matrix, 0, seed).unwrap();
+        let current_result = laczos::svd_dim_seed(&test_matrix, 0, seed).unwrap();
         let legacy_result = legacy::svd_dim_seed(&test_matrix, 0, seed).unwrap();
 
         // Compare dimensions
@@ -129,12 +127,12 @@ mod simple_comparison_tests {
         let csr = CsrMatrix::from(&coo);
 
         // Calculate SVD using original method
-        let legacy_svd = svd_dim_seed(&csr, 0, seed as u32).unwrap();
+        let legacy_svd = laczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
 
         // Calculate SVD using our masked method (using all columns)
         let mask = vec![true; ncols];
-        let masked_matrix = MaskedCSRMatrix::new(&csr, mask);
-        let current_svd = svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
+        let masked_matrix = laczos::masked::MaskedCSRMatrix::new(&csr, mask);
+        let current_svd = laczos::svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
 
         // Compare with relative tolerance
         let rel_tol = 1e-3;  // 0.1% relative tolerance
@@ -161,13 +159,12 @@ mod simple_comparison_tests {
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
         
         // Should no longer fail with convergence error
-        let result = svd_dim_seed(&test_matrix, 50, 42);
+        let result = laczos::svd_dim_seed(&test_matrix, 50, 42);
         assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
     }
 
     #[test]
     fn test_random_svd_computation() {
-        use crate::{randomized_svd, PowerIterationNormalizer};
 
         // Create a matrix with high sparsity (99%)
         let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
@@ -176,12 +173,12 @@ mod simple_comparison_tests {
         let csr = CsrMatrix::from(&test_matrix);
 
         // Run randomized SVD with reasonable defaults for a sparse matrix
-        let result = randomized_svd(
+        let result = randomized::randomized_svd(
             &csr,
             50,                              // target rank
             10,                              // oversampling parameter
             3,                               // power iterations
-            PowerIterationNormalizer::QR,    // use QR normalization
+            randomized::PowerIterationNormalizer::QR,    // use QR normalization
             Some(42),                        // random seed
         );
 
@@ -219,7 +216,6 @@ mod simple_comparison_tests {
 
     #[test]
     fn test_randomized_svd_very_large_sparse_matrix() {
-        use crate::{randomized_svd, PowerIterationNormalizer};
 
         // Create a very large matrix with high sparsity (99%)
         let test_matrix = create_sparse_matrix(100000, 2500, 0.01); // 1% non-zeros
@@ -230,12 +226,12 @@ mod simple_comparison_tests {
         // Run randomized SVD with reasonable defaults for a sparse matrix
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
-             randomized_svd(
+            randomized::randomized_svd(
                 &csr,
                 50,                              // target rank
                 10,                              // oversampling parameter
-                2,                               // power iterations
-                PowerIterationNormalizer::QR,    // use QR normalization
+                7,                               // power iterations
+                randomized::PowerIterationNormalizer::QR,    // use QR normalization
                 Some(42),                        // random seed
             )
         });
@@ -251,7 +247,6 @@ mod simple_comparison_tests {
 
     #[test]
     fn test_randomized_svd_small_sparse_matrix() {
-        use crate::{randomized_svd, PowerIterationNormalizer};
 
         // Create a very large matrix with high sparsity (99%)
         let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
@@ -262,12 +257,12 @@ mod simple_comparison_tests {
         // Run randomized SVD with reasonable defaults for a sparse matrix
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
-            randomized_svd(
+            randomized::randomized_svd(
                 &csr,
                 50,                              // target rank
                 10,                              // oversampling parameter
                 2,                               // power iterations
-                PowerIterationNormalizer::QR,    // use QR normalization
+                randomized::PowerIterationNormalizer::QR,    // use QR normalization
                 Some(42),                        // random seed
             )
         });
