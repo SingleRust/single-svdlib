@@ -11,6 +11,7 @@ use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator};
 use std::ops::Mul;
 use crate::utils::determine_chunk_size;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PowerIterationNormalizer {
     QR,
     LU,
