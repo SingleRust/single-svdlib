@@ -4,7 +4,7 @@ pub(crate) mod utils;
 
 pub mod randomized;
 
-pub mod laczos;
+pub mod lanczos;
 
 pub use utils::*;
 
@@ -75,7 +75,7 @@ mod simple_comparison_tests {
 
         // Run both implementations with the same seed for deterministic behavior
         let seed = 42;
-        let current_result = laczos::svd_dim_seed(&test_matrix, 0, seed).unwrap();
+        let current_result = lanczos::svd_dim_seed(&test_matrix, 0, seed).unwrap();
         let legacy_result = legacy::svd_dim_seed(&test_matrix, 0, seed).unwrap();
 
         // Compare dimensions
@@ -127,12 +127,12 @@ mod simple_comparison_tests {
         let csr = CsrMatrix::from(&coo);
 
         // Calculate SVD using original method
-        let legacy_svd = laczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
+        let legacy_svd = lanczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
 
         // Calculate SVD using our masked method (using all columns)
         let mask = vec![true; ncols];
-        let masked_matrix = laczos::masked::MaskedCSRMatrix::new(&csr, mask);
-        let current_svd = laczos::svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
+        let masked_matrix = lanczos::masked::MaskedCSRMatrix::new(&csr, mask);
+        let current_svd = lanczos::svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
 
         // Compare with relative tolerance
         let rel_tol = 1e-3;  // 0.1% relative tolerance
@@ -159,7 +159,7 @@ mod simple_comparison_tests {
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
         
         // Should no longer fail with convergence error
-        let result = laczos::svd_dim_seed(&test_matrix, 50, 42);
+        let result = lanczos::svd_dim_seed(&test_matrix, 50, 42);
         assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
     }
 

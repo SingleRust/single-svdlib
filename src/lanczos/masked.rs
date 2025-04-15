@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(masked.nnz(), 6); // Only entries in the selected columns
 
         // Test SVD on the masked matrix
-        let svd_result = crate::laczos::svd(&masked);
+        let svd_result = crate::lanczos::svd(&masked);
         assert!(svd_result.is_ok());
     }
 
@@ -304,8 +304,8 @@ mod tests {
         assert_eq!(masked_matrix.nnz(), physical_csr.nnz());
 
         // Perform SVD on both
-        let svd_masked = crate::laczos::svd(&masked_matrix).unwrap();
-        let svd_physical = crate::laczos::svd(&physical_csr).unwrap();
+        let svd_masked = crate::lanczos::svd(&masked_matrix).unwrap();
+        let svd_physical = crate::lanczos::svd(&physical_csr).unwrap();
 
         // Compare SVD results - they should be very close but not exactly the same
         // due to potential differences in numerical computation
