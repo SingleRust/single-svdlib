@@ -1,5 +1,8 @@
+pub mod masked;
+
 use crate::error::SvdLibError;
-use ndarray::{Array, Array1, Array2};
+use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
+use ndarray::{Array, Array2};
 use num_traits::real::Real;
 use num_traits::{Float, FromPrimitive, One, Zero};
 use rand::rngs::StdRng;
@@ -12,106 +15,7 @@ use std::iter::Sum;
 use std::mem;
 use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
 
-pub trait SMat<T: Float>: Sync {
-    fn nrows(&self) -> usize;
-    fn ncols(&self) -> usize;
-    fn nnz(&self) -> usize;
-    fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
-}
-
-/// Singular Value Decomposition Components
-///
-/// # Fields
-/// - d:  Dimensionality (rank), the number of rows of both `ut`, `vt` and the length of `s`
-/// - ut: Transpose of left singular vectors, the vectors are the rows of `ut`
-/// - s:  Singular values (length `d`)
-/// - vt: Transpose of right singular vectors, the vectors are the rows of `vt`
-/// - diagnostics: Computational diagnostics
-#[derive(Debug, Clone, PartialEq)]
-pub struct SvdRec<T: Float> {
-    pub d: usize,
-    pub ut: Array2<T>,
-    pub s: Array1<T>,
-    pub vt: Array2<T>,
-    pub diagnostics: Diagnostics<T>,
-}
-
-/// Computational Diagnostics
-///
-/// # Fields
-/// - non_zero:  Number of non-zeros in the matrix
-/// - dimensions: Number of dimensions attempted (bounded by matrix shape)
-/// - iterations: Number of iterations attempted (bounded by dimensions and matrix shape)
-/// - transposed:  True if the matrix was transposed internally
-/// - lanczos_steps: Number of Lanczos steps performed
-/// - ritz_values_stabilized: Number of ritz values
-/// - significant_values: Number of significant values discovered
-/// - singular_values: Number of singular values returned
-/// - end_interval: left, right end of interval containing unwanted eigenvalues
-/// - kappa: relative accuracy of ritz values acceptable as eigenvalues
-/// - random_seed: Random seed provided or the seed generated
-#[derive(Debug, Clone, PartialEq)]
-pub struct Diagnostics<T: Float> {
-    pub non_zero: usize,
-    pub dimensions: usize,
-    pub iterations: usize,
-    pub transposed: bool,
-    pub lanczos_steps: usize,
-    pub ritz_values_stabilized: usize,
-    pub significant_values: usize,
-    pub singular_values: usize,
-    pub end_interval: [T; 2],
-    pub kappa: T,
-    pub random_seed: u32,
-}
-
 /// Trait for floating point types that can be used with the SVD algorithm
-pub trait SvdFloat:
-    Float
-    + FromPrimitive
-    + Debug
-    + Send
-    + Sync
-    + Zero
-    + One
-    + AddAssign
-    + SubAssign
-    + MulAssign
-    + Neg<Output = Self>
-    + Sum
-{
-    fn eps() -> Self;
-    fn eps34() -> Self;
-    fn compare(a: Self, b: Self) -> bool;
-}
-
-impl SvdFloat for f32 {
-    fn eps() -> Self {
-        f32::EPSILON
-    }
-
-    fn eps34() -> Self {
-        f32::EPSILON.powf(0.75)
-    }
-
-    fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f32::EPSILON
-    }
-}
-
-impl SvdFloat for f64 {
-    fn eps() -> Self {
-        f64::EPSILON
-    }
-
-    fn eps34() -> Self {
-        f64::EPSILON.powf(0.75)
-    }
-
-    fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f64::EPSILON
-    }
-}
 
 /// SVD at full dimensionality, calls `svdLAS2` with the highlighted defaults
 ///
@@ -1229,7 +1133,6 @@ fn ritvec<T: SvdFloat>(
     let significant_indices: Vec<usize> = (0..js)
         .into_par_iter()
         .filter(|&k| {
-            // Adaptive error bound check using relative tolerance
             let relative_bound =
                 adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
             wrk.bnd[k] <= relative_bound && k + 1 > js - neig
@@ -1242,11 +1145,10 @@ fn ritvec<T: SvdFloat>(
         .into_par_iter()
         .map(|k| {
             let mut vec = vec![T::zero(); wrk.ncols];
-            let mut idx = (jsq - js) + k + 1;
 
             for i in 0..js {
-                idx -= js;
-                // Non-zero check with adaptive threshold
+                let idx = k * js + i;
+
                 if s[idx].abs() > adaptive_eps {
                     for (j, item) in store_vectors[i].iter().enumerate().take(wrk.ncols) {
                         vec[j] += s[idx] * *item;
@@ -1254,7 +1156,6 @@ fn ritvec<T: SvdFloat>(
                 }
             }
 
-            // Return with position index (for proper ordering)
             (k, vec)
         })
         .collect();

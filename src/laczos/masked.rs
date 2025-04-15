@@ -76,7 +76,7 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
 
         for i in 0..self.matrix.nrows() {
             for j in major_offsets[i]..major_offsets[i + 1] {
-                let col = minor_indices[j]; 
+                let col = minor_indices[j];
                 if self.column_mask[col] {
                     count += 1;
                 }
@@ -213,7 +213,7 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{svd, SMat};
+    use crate::{SMat};
     use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(masked.nnz(), 6); // Only entries in the selected columns
 
         // Test SVD on the masked matrix
-        let svd_result = svd(&masked);
+        let svd_result = crate::laczos::svd(&masked);
         assert!(svd_result.is_ok());
     }
 
@@ -304,8 +304,8 @@ mod tests {
         assert_eq!(masked_matrix.nnz(), physical_csr.nnz());
 
         // Perform SVD on both
-        let svd_masked = svd(&masked_matrix).unwrap();
-        let svd_physical = svd(&physical_csr).unwrap();
+        let svd_masked = crate::laczos::svd(&masked_matrix).unwrap();
+        let svd_physical = crate::laczos::svd(&physical_csr).unwrap();
 
         // Compare SVD results - they should be very close but not exactly the same
         // due to potential differences in numerical computation
