@@ -34,7 +34,7 @@ pub trait SMat<T: Float>: Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SvdRec<T: Float> {
     pub d: usize,
-    pub ut: Array2<T>,
+    pub u: Array2<T>,
     pub s: Array1<T>,
     pub vt: Array2<T>,
     pub diagnostics: Diagnostics<T>,

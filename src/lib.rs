@@ -166,20 +166,18 @@ mod simple_comparison_tests {
     #[test]
     fn test_random_svd_computation() {
 
-        // Create a matrix with high sparsity (99%)
         let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
 
-        // Convert to CSR for processing
         let csr = CsrMatrix::from(&test_matrix);
 
-        // Run randomized SVD with reasonable defaults for a sparse matrix
         let result = randomized::randomized_svd(
             &csr,
-            50,                              // target rank
-            10,                              // oversampling parameter
-            3,                               // power iterations
-            randomized::PowerIterationNormalizer::QR,    // use QR normalization
-            Some(42),                        // random seed
+            50,
+            10,
+            3,
+            randomized::PowerIterationNormalizer::QR,
+            false,
+            Some(42),
         );
 
         // Verify the computation succeeds on a highly sparse matrix
@@ -206,8 +204,8 @@ mod simple_comparison_tests {
             }
 
             // Verify basics of U and V dimensions
-            assert_eq!(svd_result.ut.nrows(), 50, "U transpose should have 50 rows");
-            assert_eq!(svd_result.ut.ncols(), 1000, "U transpose should have 1000 columns");
+            assert_eq!(svd_result.u.nrows(), 50, "U transpose should have 50 rows");
+            assert_eq!(svd_result.u.ncols(), 1000, "U transpose should have 1000 columns");
             assert_eq!(svd_result.vt.nrows(), 50, "V transpose should have 50 rows");
             assert_eq!(svd_result.vt.ncols(), 250, "V transpose should have 250 columns");
 
@@ -232,6 +230,7 @@ mod simple_comparison_tests {
                 10,                              // oversampling parameter
                 7,                               // power iterations
                 randomized::PowerIterationNormalizer::QR,    // use QR normalization
+                false,
                 Some(42),                        // random seed
             )
         });
@@ -263,6 +262,7 @@ mod simple_comparison_tests {
                 10,                              // oversampling parameter
                 2,                               // power iterations
                 randomized::PowerIterationNormalizer::QR,    // use QR normalization
+                false,
                 Some(42),                        // random seed
             )
         });
