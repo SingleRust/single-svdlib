@@ -1,5 +1,8 @@
+pub mod masked;
+
 use crate::error::SvdLibError;
-use ndarray::{Array, Array1, Array2};
+use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
+use ndarray::{Array, Array2};
 use num_traits::real::Real;
 use num_traits::{Float, FromPrimitive, One, Zero};
 use rand::rngs::StdRng;
@@ -12,106 +15,7 @@ use std::iter::Sum;
 use std::mem;
 use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
 
-pub trait SMat<T: Float>: Sync {
-    fn nrows(&self) -> usize;
-    fn ncols(&self) -> usize;
-    fn nnz(&self) -> usize;
-    fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
-}
-
-/// Singular Value Decomposition Components
-///
-/// # Fields
-/// - d:  Dimensionality (rank), the number of rows of both `ut`, `vt` and the length of `s`
-/// - ut: Transpose of left singular vectors, the vectors are the rows of `ut`
-/// - s:  Singular values (length `d`)
-/// - vt: Transpose of right singular vectors, the vectors are the rows of `vt`
-/// - diagnostics: Computational diagnostics
-#[derive(Debug, Clone, PartialEq)]
-pub struct SvdRec<T: Float> {
-    pub d: usize,
-    pub ut: Array2<T>,
-    pub s: Array1<T>,
-    pub vt: Array2<T>,
-    pub diagnostics: Diagnostics<T>,
-}
-
-/// Computational Diagnostics
-///
-/// # Fields
-/// - non_zero:  Number of non-zeros in the matrix
-/// - dimensions: Number of dimensions attempted (bounded by matrix shape)
-/// - iterations: Number of iterations attempted (bounded by dimensions and matrix shape)
-/// - transposed:  True if the matrix was transposed internally
-/// - lanczos_steps: Number of Lanczos steps performed
-/// - ritz_values_stabilized: Number of ritz values
-/// - significant_values: Number of significant values discovered
-/// - singular_values: Number of singular values returned
-/// - end_interval: left, right end of interval containing unwanted eigenvalues
-/// - kappa: relative accuracy of ritz values acceptable as eigenvalues
-/// - random_seed: Random seed provided or the seed generated
-#[derive(Debug, Clone, PartialEq)]
-pub struct Diagnostics<T: Float> {
-    pub non_zero: usize,
-    pub dimensions: usize,
-    pub iterations: usize,
-    pub transposed: bool,
-    pub lanczos_steps: usize,
-    pub ritz_values_stabilized: usize,
-    pub significant_values: usize,
-    pub singular_values: usize,
-    pub end_interval: [T; 2],
-    pub kappa: T,
-    pub random_seed: u32,
-}
-
 /// Trait for floating point types that can be used with the SVD algorithm
-pub trait SvdFloat:
-    Float
-    + FromPrimitive
-    + Debug
-    + Send
-    + Sync
-    + Zero
-    + One
-    + AddAssign
-    + SubAssign
-    + MulAssign
-    + Neg<Output = Self>
-    + Sum
-{
-    fn eps() -> Self;
-    fn eps34() -> Self;
-    fn compare(a: Self, b: Self) -> bool;
-}
-
-impl SvdFloat for f32 {
-    fn eps() -> Self {
-        f32::EPSILON
-    }
-
-    fn eps34() -> Self {
-        f32::EPSILON.powf(0.75)
-    }
-
-    fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f32::EPSILON
-    }
-}
-
-impl SvdFloat for f64 {
-    fn eps() -> Self {
-        f64::EPSILON
-    }
-
-    fn eps34() -> Self {
-        f64::EPSILON.powf(0.75)
-    }
-
-    fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f64::EPSILON
-    }
-}
 
 /// SVD at full dimensionality, calls `svdLAS2` with the highlighted defaults
 ///
@@ -1157,7 +1061,7 @@ fn ritvec<T: SvdFloat>(
 
     let sparsity = T::one()
         - (T::from_usize(A.nnz()).unwrap()
-        / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
+            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
 
     let epsilon = T::epsilon();
     let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
@@ -1229,7 +1133,6 @@ fn ritvec<T: SvdFloat>(
     let significant_indices: Vec<usize> = (0..js)
         .into_par_iter()
         .filter(|&k| {
-            // Adaptive error bound check using relative tolerance
             let relative_bound =
                 adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
             wrk.bnd[k] <= relative_bound && k + 1 > js - neig
@@ -1242,11 +1145,10 @@ fn ritvec<T: SvdFloat>(
         .into_par_iter()
         .map(|k| {
             let mut vec = vec![T::zero(); wrk.ncols];
-            let mut idx = (jsq - js) + k + 1;
 
             for i in 0..js {
-                idx -= js;
-                // Non-zero check with adaptive threshold
+                let idx = k * js + i;
+
                 if s[idx].abs() > adaptive_eps {
                     for (j, item) in store_vectors[i].iter().enumerate().take(wrk.ncols) {
                         vec[j] += s[idx] * *item;
@@ -1254,7 +1156,6 @@ fn ritvec<T: SvdFloat>(
                 }
             }
 
-            // Return with position index (for proper ordering)
             (k, vec)
         })
         .collect();
@@ -1322,7 +1223,7 @@ fn ritvec<T: SvdFloat>(
         S[i] = sval;
         let ut_offset = i * Ut.cols;
         let mut ut_vec = a_products[i].clone();
-        
+
         if sval > adaptive_eps {
             svd_dscal(T::one() / sval, &mut ut_vec);
         } else {
@@ -1541,7 +1442,7 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
 }
 
 #[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
+impl<T: Float + Zero + AddAssign + Clone + Sync + Send> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
     fn nnz(&self) -> usize { self.nnz() }
@@ -1556,22 +1457,59 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
 
         let (major_offsets, minor_indices, values) = self.csr_data();
 
-        for y_val in y.iter_mut() {
-            *y_val = T::zero();
-        }
+        y.fill(T::zero());
 
         if !transposed {
-            for (i, yval) in y.iter_mut().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    *yval += values[j] * x[minor_indices[j]];
-                }
+            let nrows = self.nrows();
+            let chunk_size = crate::utils::determine_chunk_size(nrows);
+
+            // Create thread-local vectors with results
+            let results: Vec<(usize, T)> = (0..nrows)
+                .into_par_iter()
+                .map(|i| {
+                    let mut sum = T::zero();
+                    for j in major_offsets[i]..major_offsets[i + 1] {
+                        sum += values[j] * x[minor_indices[j]];
+                    }
+                (i, sum)
+            })
+            .collect();
+
+            // Apply the results to y
+            for (i, val) in results {
+                y[i] = val;
             }
         } else {
-            for (i, xval) in x.iter().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    y[minor_indices[j]] += values[j] * *xval;
+            let nrows = self.nrows();
+        let chunk_size = crate::utils::determine_chunk_size(nrows);
+
+        // Process input in chunks and create partial results
+        let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nrows);
+
+                let mut local_y = vec![T::zero(); y.len()];
+                for i in start..end {
+                    let row_val = x[i];
+                    for j in major_offsets[i]..major_offsets[i + 1] {
+                        let col = minor_indices[j];
+                        local_y[col] += values[j] * row_val;
+                    }
+                }
+                local_y
+            })
+            .collect();
+
+        // Combine partial results
+        for local_y in results {
+            for (idx, val) in local_y.iter().enumerate() {
+                if !val.is_zero() {
+                    y[idx] += *val;
                 }
             }
+        }
         }
     }
 }

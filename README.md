@@ -1,23 +1,27 @@
-# single_svdlib
+# Single-SVDLib: Singular Value Decomposition for Sparse Matrices
 
-A Rust library for performing Singular Value Decomposition (SVD) on sparse matrices using the Lanczos algorithm. It is build on the original library and expan
+[![Crate](https://img.shields.io/crates/v/single-svdlib.svg)](https://crates.io/crates/single-svdlib)
+[![Documentation](https://docs.rs/single-svdlib/badge.svg)](https://docs.rs/single-svdlib)
+[![License](https://img.shields.io/crates/l/single-svdlib.svg)](LICENSE)
 
-## Overview
-
-`svdlibrs` is a Rust port of LAS2 from SVDLIBC, originally developed by Doug Rohde. This library efficiently computes SVD on sparse matrices, particularly large ones, and returns the decomposition as ndarray components.
-
-This implementation extends the original [svdlibrs](https://github.com/dfarnham/svdlibrs) by Dave Farnham with:
-- Updated dependency versions
-- Support for a broader range of numeric types (f64, f32, others)
-- Column masking capabilities for analyzing specific subsets of data
+A high-performance Rust library for computing Singular Value Decomposition (SVD) on sparse matrices, with support for both Lanczos and randomized SVD algorithms.
 
 ## Features
 
-- Performs SVD on sparse matrices using the Lanczos algorithm
-- Works with various input formats: CSR, CSC, or COO matrices
-- Column masking for dimension selection without data copying
-- Generic implementation supporting different numeric types
-- High numerical precision for critical calculations
+- **Multiple SVD algorithms**:
+    - Lanczos algorithm (based on SVDLIBC)
+    - Randomized SVD for very large and sparse matrices
+- **Sparse matrix support**:
+    - Compressed Sparse Row (CSR) format
+    - Compressed Sparse Column (CSC) format
+    - Coordinate (COO) format
+- **Performance optimizations**:
+    - Parallel execution with Rayon
+    - Adaptive tuning for highly sparse matrices
+    - Column masking for subspace SVD
+- **Generic interface**:
+    - Works with both `f32` and `f64` precision
+- **Comprehensive error handling and diagnostics**
 
 ## Installation
 
@@ -25,144 +29,147 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-single-svdlib = "0.1.0"
-nalgebra-sparse = "0.10.0"
-ndarray = "0.16.1"
+single-svdlib = "0.6.0"
 ```
 
-## Basic Usage
+## Quick Start
 
 ```rust
-use single_svdlib::{svd, svd_dim, svd_dim_seed};
 use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
+use single_svdlib::laczos::svd_dim_seed;
 
-// Create a sparse matrix
+// Create a matrix in COO format
 let mut coo = CooMatrix::<f64>::new(3, 3);
 coo.push(0, 0, 1.0); coo.push(0, 1, 16.0); coo.push(0, 2, 49.0);
 coo.push(1, 0, 4.0); coo.push(1, 1, 25.0); coo.push(1, 2, 64.0);
 coo.push(2, 0, 9.0); coo.push(2, 1, 36.0); coo.push(2, 2, 81.0);
 
+// Convert to CSR for better performance
 let csr = CsrMatrix::from(&coo);
 
-// Compute SVD
-let svd_result = svd(&csr)?;
+// Compute SVD with a fixed random seed
+let svd = svd_dim_seed(&csr, 3, 42).unwrap();
 
 // Access the results
-println!("Rank: {}", svd_result.d);
-println!("Singular values: {:?}", svd_result.s);
-println!("Left singular vectors (U): {:?}", svd_result.ut.t());
-println!("Right singular vectors (V): {:?}", svd_result.vt.t());
+let singular_values = &svd.s;
+let left_singular_vectors = &svd.ut;  // Note: These are transposed
+let right_singular_vectors = &svd.vt; // Note: These are transposed
 
 // Reconstruct the original matrix
-let reconstructed = svd_result.recompose();
+let reconstructed = svd.recompose();
 ```
 
-## Column Masking
+## SVD Methods
 
-The library supports analyzing specific columns without copying the data:
+### Lanczos Algorithm (LAS2)
 
-```rust
-use single_svdlib::{svd, MaskedCSRMatrix};
-use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
-
-// Create a sparse matrix
-let mut coo = CooMatrix::<f64>::new(3, 5);
-coo.push(0, 0, 1.0); coo.push(0, 2, 2.0); coo.push(0, 4, 3.0);
-coo.push(1, 1, 4.0); coo.push(1, 3, 5.0);
-coo.push(2, 0, 6.0); coo.push(2, 2, 7.0); coo.push(2, 4, 8.0);
-
-let csr = CsrMatrix::from(&coo);
-
-// Method 1: Using a boolean mask (true = include column)
-let mask = vec![true, false, true, false, true]; // Only columns 0, 2, 4
-let masked_matrix = MaskedCSRMatrix::new(&csr, mask);
-
-// Method 2: Specifying which columns to include
-let columns = vec![0, 2, 4];
-let masked_matrix = MaskedCSRMatrix::with_columns(&csr, &columns);
-
-// Run SVD on the masked matrix
-let svd_result = svd(&masked_matrix)?;
-```
-
-## Support for Different Numeric Types
-
-The library supports various numeric types:
+The Lanczos algorithm is well-suited for sparse matrices of moderate size:
 
 ```rust
-// With f64 (double precision)
-let csr_f64 = CsrMatrix::<f64>::from(&coo);
-let svd_result = svd(&csr_f64)?;
+use single_svdlib::laczos;
 
-// With f32 (single precision)
-let csr_f32 = CsrMatrix::<f32>::from(&coo);
-let svd_result = svd(&csr_f32)?;
+// Basic SVD computation (uses defaults)
+let svd = laczos::svd(&matrix)?;
 
-// With integer types (converted internally)
-let csr_i32 = CsrMatrix::<i32>::from(&coo);
-let masked_i32 = MaskedCSRMatrix::with_columns(&csr_i32, &columns);
-let svd_result = svd(&masked_i32)?;
-```
+// SVD with specified target rank
+let svd = laczos::svd_dim(&matrix, 10)?;
 
-## Advanced Usage
+// SVD with specified target rank and fixed random seed
+let svd = laczos::svd_dim_seed(&matrix, 10, 42)?;
 
-For more control over the SVD computation:
-
-```rust
-use single_svdlib::{svdLAS2, SvdRec};
-
-// Customize the SVD calculation
-let svd: SvdRec = svdLAS2(
-    &matrix,        // sparse matrix
-    dimensions,     // upper limit of desired dimensions (0 = max)
-    iterations,     // number of algorithm iterations (0 = auto)
-    &[-1.0e-30, 1.0e-30], // interval for unwanted eigenvalues
-    1.0e-6,         // relative accuracy threshold
-    random_seed,    // random seed (0 = auto-generate)
+// Full control over SVD parameters
+let svd = laczos::svd_las2(
+    &matrix,
+    dimensions,    // upper limit of desired number of dimensions
+    iterations,    // number of Lanczos iterations
+    end_interval,  // interval containing unwanted eigenvalues, e.g. [-1e-30, 1e-30]
+    kappa,         // relative accuracy of eigenvalues, e.g. 1e-6
+    random_seed,   // random seed (0 for automatic)
 )?;
 ```
 
-## SVD Results and Diagnostics
+### Randomized SVD
 
-The SVD results are returned in a `SvdRec` struct:
+For very large sparse matrices, the randomized SVD algorithm offers better performance:
 
 ```rust
-pub struct SvdRec {
-    pub d: usize,        // Dimensionality (rank)
-    pub ut: Array2<f64>, // Transpose of left singular vectors
-    pub s: Array1<f64>,  // Singular values
-    pub vt: Array2<f64>, // Transpose of right singular vectors
-    pub diagnostics: Diagnostics, // Computational diagnostics
+use single_svdlib::randomized;
+
+let svd = randomized::randomized_svd(
+    &matrix,
+    target_rank,                         // desired rank
+    n_oversamples,                       // oversampling parameter (typically 5-10)
+    n_power_iterations,                  // number of power iterations (typically 2-4)
+    randomized::PowerIterationNormalizer::QR,  // normalization method
+    Some(42),                           // random seed (None for automatic)
+)?;
+```
+
+### Column Masking
+
+For operations on specific columns of a matrix:
+
+```rust
+use single_svdlib::laczos::masked::MaskedCSRMatrix;
+
+// Create a mask for selected columns
+let columns = vec![0, 2, 5, 7];  // Only use these columns
+let masked_matrix = MaskedCSRMatrix::with_columns(&csr_matrix, &columns);
+
+// Compute SVD on the masked matrix
+let svd = laczos::svd(&masked_matrix)?;
+```
+
+## Result Structure
+
+The SVD result contains:
+
+```rust
+struct SvdRec<T> {
+    d: usize,              // Rank (number of singular values)
+    ut: Array2<T>,         // Transpose of left singular vectors (d x m)
+    s: Array1<T>,          // Singular values (d)
+    vt: Array2<T>,         // Transpose of right singular vectors (d x n)
+    diagnostics: Diagnostics<T>,  // Computation diagnostics
 }
 ```
 
-The `Diagnostics` struct provides detailed information about the computation:
+Note that `ut` and `vt` are returned in transposed form.
+
+## Diagnostics
+
+Each SVD computation returns detailed diagnostics:
 
 ```rust
-pub struct Diagnostics {
-    pub non_zero: usize,   // Number of non-zeros in the input matrix
-    pub dimensions: usize, // Number of dimensions attempted
-    pub iterations: usize, // Number of iterations attempted
-    pub transposed: bool,  // True if the matrix was transposed internally
-    pub lanczos_steps: usize,          // Number of Lanczos steps
-    pub ritz_values_stabilized: usize, // Number of ritz values
-    pub significant_values: usize,     // Number of significant values
-    pub singular_values: usize,        // Number of singular values
-    pub end_interval: [f64; 2], // Interval for unwanted eigenvalues
-    pub kappa: f64,             // Relative accuracy threshold
-    pub random_seed: u32,       // Random seed used
-}
+let svd = laczos::svd(&matrix)?;
+println!("Non-zero elements: {}", svd.diagnostics.non_zero);
+println!("Transposed during computation: {}", svd.diagnostics.transposed);
+println!("Lanczos steps: {}", svd.diagnostics.lanczos_steps);
+println!("Significant values found: {}", svd.diagnostics.significant_values);
 ```
+
+## Performance Tips
+
+1. **Choose the right algorithm**:
+    - For matrices up to ~10,000 x 10,000 with moderate sparsity, use the Lanczos algorithm
+    - For larger matrices or very high sparsity (>99%), use randomized SVD
+
+2. **Matrix format matters**:
+    - Convert COO matrices to CSR or CSC for computation
+    - CSR typically performs better for row-oriented operations
+
+3. **Adjust parameters for very sparse matrices**:
+    - Increase power iterations in randomized SVD (e.g., 5-7)
+    - Use a higher `kappa` value in Lanczos for very sparse matrices
+
+4. **Consider column masking** for operations that only need a subset of the data
 
 ## License
 
-This library is provided under the BSD License, as per the original SVDLIBC implementation.
+This crate is licensed under the BSD License, the same as the original SVDLIBC implementation. See the `SVDLIBC-LICENSE.txt` file for details.
 
-## Acknowledgments
+## Credits
 
-- Dave Farnham for the original Rust port
-- Doug Rohde for the original SVDLIBC implementation
-- University of Tennessee Research Foundation for the underlying mathematical library
-
-[Latest Version]: https://img.shields.io/crates/v/single-svdlib.svg
-[crates.io]: https://crates.io/crates/single-svdlib
+- Original SVDLIBC implementation by Doug Rohde
+- Rust port maintainer of SVDLIBC: Dave Farnham
+- Extensions and modifications of the original algorithm: Ian F. Diks
