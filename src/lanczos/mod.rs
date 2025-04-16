@@ -168,7 +168,7 @@ where
     Ok(SvdRec {
         // Dimensionality (number of Ut,Vt rows & length of S)
         d: r.d,
-        ut: Array2::from_shape_vec((r.d, r.Ut.cols), r.Ut.value)?,
+        u: Array2::from_shape_vec((r.d, r.Ut.cols), r.Ut.value)?,
         s: Array::from_shape_vec(r.d, r.S)?,
         vt: Array2::from_shape_vec((r.d, r.Vt.cols), r.Vt.value)?,
         diagnostics: Diagnostics {
@@ -1402,7 +1402,7 @@ fn lanso<T: SvdFloat>(
 impl<T: SvdFloat + 'static> SvdRec<T> {
     pub fn recompose(&self) -> Array2<T> {
         let sdiag = Array2::from_diag(&self.s);
-        self.ut.t().dot(&sdiag).dot(&self.vt)
+        self.u.dot(&sdiag).dot(&self.vt)
     }
 }
 
