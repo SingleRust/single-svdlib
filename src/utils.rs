@@ -3,6 +3,7 @@ use num_traits::{Float, FromPrimitive, One, Zero};
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
+use single_utilities::traits::FloatOpsTS;
 
 pub fn determine_chunk_size(nrows: usize) -> usize {
     let num_threads = rayon::current_num_threads();
@@ -70,18 +71,7 @@ pub struct Diagnostics<T: Float> {
 }
 
 pub trait SvdFloat:
-    Float
-    + FromPrimitive
-    + Debug
-    + Send
-    + Sync
-    + Zero
-    + One
-    + AddAssign
-    + SubAssign
-    + MulAssign
-    + Neg<Output = Self>
-    + Sum
+    FloatOpsTS
 {
     fn eps() -> Self;
     fn eps34() -> Self;
