@@ -22,6 +22,8 @@ pub trait SMat<T: Float>: Sync {
     fn ncols(&self) -> usize;
     fn nnz(&self) -> usize;
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
+    
+    fn compute_column_means(&self) -> Vec<T>;
 }
 
 /// Singular Value Decomposition Components

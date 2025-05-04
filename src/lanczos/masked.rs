@@ -1,8 +1,8 @@
-use rayon::iter::IndexedParallelIterator;
 use crate::utils::determine_chunk_size;
 use crate::{SMat, SvdFloat};
 use nalgebra_sparse::CsrMatrix;
 use num_traits::Float;
+use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::{IntoParallelIterator, ParallelBridge, ParallelSliceMut};
 use std::ops::AddAssign;
@@ -62,7 +62,7 @@ impl<'a, T: Float> MaskedCSRMatrix<'a, T> {
     }
 }
 
-impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> {
+impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
     fn nrows(&self) -> usize {
         self.matrix.nrows()
     }
@@ -121,29 +121,29 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
             // A * x calculation
             let row_count = self.matrix.nrows();
             let (major_offsets, minor_indices, values) = self.matrix.csr_data();
-            
+
             let chunk_size = std::cmp::max(16, row_count / (rayon::current_num_threads() * 2));
-            
+
             let mut valid_indices = Vec::with_capacity(self.matrix.ncols());
             for col in 0..self.matrix.ncols() {
                 valid_indices.push(self.original_to_masked[col]);
             }
-            
+
             y.par_chunks_mut(chunk_size)
                 .enumerate()
                 .for_each(|(chunk_idx, y_chunk)| {
                     let start_row = chunk_idx * chunk_size;
                     let end_row = (start_row + y_chunk.len()).min(row_count);
-                    
+
                     for i in start_row..end_row {
                         let row_idx = i - start_row;
                         let mut sum = T::zero();
-                        
+
                         let row_start = major_offsets[i];
                         let row_end = major_offsets[i + 1];
-                        
+
                         let mut j = row_start;
-                        
+
                         while j + 4 <= row_end {
                             for offset in 0..4 {
                                 let idx = j + offset;
@@ -154,7 +154,7 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
                             }
                             j += 4;
                         }
-                        
+
                         while j < row_end {
                             let col = minor_indices[j];
                             if let Some(masked_col) = valid_indices[col] {
@@ -202,12 +202,37 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
             }
         }
     }
+
+    fn compute_column_means(&self) -> Vec<T> {
+        let rows = self.nrows();
+        let masked_cols = self.ncols();
+        let row_count_recip = T::one() / T::from(rows).unwrap();
+
+        let mut col_sums = vec![T::zero(); masked_cols];
+        let (row_offsets, col_indices, values) = self.matrix.csr_data();
+        
+        for i in 0..rows {
+            for j in row_offsets[i]..row_offsets[i + 1] {
+                let original_col = col_indices[j];
+                if let Some(masked_col) = self.original_to_masked[original_col] {
+                    col_sums[masked_col] += values[j];
+                }
+            }
+        }
+
+        // Convert to means
+        for j in 0..masked_cols {
+            col_sums[j] *= row_count_recip;
+        }
+
+        col_sums
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SMat};
+    use crate::SMat;
     use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};

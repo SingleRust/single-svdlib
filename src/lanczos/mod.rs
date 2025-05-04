@@ -6,7 +6,7 @@ use ndarray::{Array, Array2};
 use num_traits::real::Real;
 use num_traits::{Float, FromPrimitive, One, Zero};
 use rand::rngs::StdRng;
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::{rng, Rng, RngCore, SeedableRng};
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator};
@@ -114,7 +114,7 @@ where
 {
     let random_seed = match random_seed > 0 {
         true => random_seed,
-        false => thread_rng().gen::<_>(),
+        false => rng().next_u32(),
     };
 
     let min_nrows_ncols = a.nrows().min(a.ncols());
@@ -158,7 +158,7 @@ where
         random_seed,
     )?;
 
-    let kappa = kappa.abs().max(T::eps34());
+    let kappa = Float::max(Float::abs(kappa), T::eps34());
     let mut r = ritvec(a, dimensions, kappa, &mut wrk, steps, neig, &mut store)?;
 
     if transposed {
@@ -358,10 +358,10 @@ fn svd_fsign<T: Float>(a: T, b: T) -> T {
 
 // finds sqrt(a^2 + b^2) without overflow or destructive underflow
 fn svd_pythag<T: SvdFloat + FromPrimitive>(a: T, b: T) -> T {
-    match a.abs().max(b.abs()) {
+    match Float::max(Float::abs(a), Float::abs(b)) {
         n if n > T::zero() => {
             let mut p = n;
-            let mut r = (a.abs().min(b.abs()) / p).powi(2);
+            let mut r = Float::powi(Float::min(Float::abs(a), Float::abs(b)) / p, 2);
             let four = T::from_f64(4.0).unwrap();
             let two = T::from_f64(2.0).unwrap();
             let mut t = four + r;
@@ -369,7 +369,7 @@ fn svd_pythag<T: SvdFloat + FromPrimitive>(a: T, b: T) -> T {
                 let s = r / t;
                 let u = T::one() + two * s;
                 p = p * u;
-                r = (s / u).powi(2);
+                r = Float::powi((s / u), 2);
                 t = four + r;
             }
             p
@@ -463,14 +463,14 @@ fn imtqlb<T: SvdFloat>(
                 }
 
                 // More forgiving convergence test for large/sparse matrices
-                let test = d[m].abs() + d[m + 1].abs();
+                let test = Float::abs(d[m]) + Float::abs(d[m + 1]);
                 // Scale tolerance with matrix size and magnitude
-                let tol = T::epsilon()
+                let tol = <T as Float>::epsilon()
                     * T::from_f64(100.0).unwrap()
-                    * test.max(T::one())
+                    * Float::max(test, T::one())
                     * matrix_size_factor;
 
-                if e[m].abs() <= tol {
+                if Float::abs(e[m]) <= tol {
                     break; // Convergence achieved for this element
                 }
                 m += 1;
@@ -505,7 +505,7 @@ fn imtqlb<T: SvdFloat>(
 
                     // Set conservative error bounds for non-converged values
                     for idx in l..=m {
-                        bnd[idx] = bnd[idx].max(T::from_f64(0.1).unwrap());
+                        bnd[idx] = Float::max(bnd[idx], T::from_f64(0.1).unwrap());
                     }
 
                     // Force "convergence" by zeroing the problematic subdiagonal element
@@ -535,14 +535,19 @@ fn imtqlb<T: SvdFloat>(
                     e[i + 1] = r;
 
                     // More forgiving underflow detection for sparse matrices
-                    if r < T::epsilon() * T::from_f64(1000.0).unwrap() * (f.abs() + g.abs()) {
+                    if r < <T as Float>::epsilon()
+                        * T::from_f64(1000.0).unwrap()
+                        * (Float::abs(f) + Float::abs(g))
+                    {
                         underflow = true;
                         break;
                     }
 
                     // Safety check for division by very small numbers
-                    if r.abs() < T::epsilon() * T::from_f64(100.0).unwrap() {
-                        r = T::epsilon() * T::from_f64(100.0).unwrap() * svd_fsign(T::one(), r);
+                    if Float::abs(r) < <T as Float>::epsilon() * T::from_f64(100.0).unwrap() {
+                        r = <T as Float>::epsilon()
+                            * T::from_f64(100.0).unwrap()
+                            * svd_fsign(T::one(), r);
                     }
 
                     s = f / r;
@@ -595,7 +600,7 @@ fn startv<T: SvdFloat>(
             }
             let mut seeded_rng = StdRng::from_seed(bytes);
             for val in wrk.w0.iter_mut() {
-                *val = T::from_f64(seeded_rng.gen_range(-1.0..1.0)).unwrap();
+                *val = T::from_f64(seeded_rng.random_range(-1.0..1.0)).unwrap();
             }
         }
         wrk.w3.copy_from_slice(&wrk.w0);
@@ -647,8 +652,8 @@ fn stpone<T: SvdFloat>(
     }
 
     // normalize starting vector
-    svd_datx(rnm.recip(), &wrk.w0, &mut wrk.w1);
-    svd_dscal(rnm.recip(), &mut wrk.w3);
+    svd_datx(Float::recip(rnm), &wrk.w0, &mut wrk.w1);
+    svd_dscal(Float::recip(rnm), &mut wrk.w3);
 
     // take the first step
     svd_opb(A, &wrk.w3, &mut wrk.w0, &mut wrk.temp, wrk.transposed);
@@ -659,7 +664,7 @@ fn stpone<T: SvdFloat>(
     svd_daxpy(-t, &wrk.w1, &mut wrk.w0);
     wrk.w4.copy_from_slice(&wrk.w0);
     rnm = svd_norm(&wrk.w4);
-    let anorm = rnm + wrk.alf[0].abs();
+    let anorm = rnm + Float::abs(wrk.alf[0]);
     Ok((rnm, T::eps().sqrt() * anorm))
 }
 
@@ -704,15 +709,15 @@ fn lanczos_step<T: SvdFloat>(
         }
 
         // take a lanczos step
-        svd_datx(rnm.recip(), &wrk.w0, &mut wrk.w1);
-        svd_dscal(rnm.recip(), &mut wrk.w3);
+        svd_datx(Float::recip(*rnm), &wrk.w0, &mut wrk.w1);
+        svd_dscal(Float::recip(*rnm), &mut wrk.w3);
         svd_opb(A, &wrk.w3, &mut wrk.w0, &mut wrk.temp, wrk.transposed);
         svd_daxpy(-*rnm, &wrk.w2, &mut wrk.w0);
         wrk.alf[j] = svd_ddot(&wrk.w0, &wrk.w3);
         svd_daxpy(-wrk.alf[j], &wrk.w1, &mut wrk.w0);
 
         // orthogonalize against initial lanczos vectors
-        if j <= MAXLL && wrk.alf[j - 1].abs() > four * wrk.alf[j].abs() {
+        if j <= MAXLL && Float::abs(wrk.alf[j - 1]) > four * Float::abs(wrk.alf[j]) {
             *ll = j;
         }
         for i in 0..(j - 1).min(*ll) {
@@ -735,7 +740,7 @@ fn lanczos_step<T: SvdFloat>(
         wrk.alf[j] += t;
         wrk.w4.copy_from_slice(&wrk.w0);
         *rnm = svd_norm(&wrk.w4);
-        let anorm = wrk.bet[j] + wrk.alf[j].abs() + *rnm;
+        let anorm = wrk.bet[j] + Float::abs(wrk.alf[j]) + *rnm;
         *tol = T::eps().sqrt() * anorm;
 
         // update the orthogonality bounds
@@ -769,7 +774,7 @@ fn purge<T: SvdFloat>(
     let two = T::from_f64(2.0).unwrap();
 
     let k = svd_idamax(step - (ll + 1), &wrk.eta) + ll;
-    if wrk.eta[k].abs() > reps {
+    if Float::abs(wrk.eta[k]) > reps {
         let reps1 = eps1 / reps;
         let mut iteration = 0;
         let mut flag = true;
@@ -781,15 +786,15 @@ fn purge<T: SvdFloat>(
                 for i in ll..step {
                     let v = store.retrq(i);
                     let t = svd_ddot(v, &wrk.w3);
-                    tq += t.abs();
+                    tq += Float::abs(t);
                     svd_daxpy(-t, v, &mut wrk.w1);
                     let t = svd_ddot(v, &wrk.w4);
-                    tr += t.abs();
+                    tr += Float::abs(t);
                     svd_daxpy(-t, v, &mut wrk.w0);
                 }
                 wrk.w3.copy_from_slice(&wrk.w1);
                 let t = svd_ddot(&wrk.w0, &wrk.w3);
-                tr += t.abs();
+                tr += Float::abs(t);
                 svd_daxpy(-t, &wrk.w1, &mut wrk.w0);
                 wrk.w4.copy_from_slice(&wrk.w0);
                 *rnm = svd_norm(&wrk.w4);
@@ -848,11 +853,11 @@ fn error_bound<T: SvdFloat>(
 
     let mut i = ((step + 1) + (step - 1)) / 2;
     while i > mid + 1 {
-        if (ritz[i - 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs()
+        if Float::abs(ritz[i - 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
             && bnd[i] > tol
             && bnd[i - 1] > tol
         {
-            bnd[i - 1] = (bnd[i].powi(2) + bnd[i - 1].powi(2)).sqrt();
+            bnd[i - 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i - 1], 2)).sqrt();
             bnd[i] = T::zero();
         }
         i -= 1;
@@ -860,11 +865,11 @@ fn error_bound<T: SvdFloat>(
 
     let mut i = ((step + 1) - (step - 1)) / 2;
     while i + 1 < mid {
-        if (ritz[i + 1] - ritz[i]).abs() < T::eps34() * ritz[i].abs()
+        if Float::abs(ritz[i + 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
             && bnd[i] > tol
             && bnd[i + 1] > tol
         {
-            bnd[i + 1] = (bnd[i].powi(2) + bnd[i + 1].powi(2)).sqrt();
+            bnd[i + 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i + 1], 2)).sqrt();
             bnd[i] = T::zero();
         }
         i += 1;
@@ -878,11 +883,11 @@ fn error_bound<T: SvdFloat>(
         if i < step {
             gapl = ritz[i + 1] - ritz[i];
         }
-        gap = gap.min(gapl);
+        gap = Float::min(gap, gapl);
         if gap > bnd[i] {
             bnd[i] *= bnd[i] / gap;
         }
-        if bnd[i] <= sixteen * T::eps() * ritz[i].abs() {
+        if bnd[i] <= sixteen * T::eps() * Float::abs(ritz[i]) {
             neig += 1;
             if !*enough {
                 *enough = endl < ritz[i] && ritz[i] < endr;
@@ -925,8 +930,8 @@ fn imtql2<T: SvdFloat>(
                 if m == last {
                     break;
                 }
-                let test = d[m].abs() + d[m + 1].abs();
-                if compare(test, test + e[m].abs()) {
+                let test = Float::abs(d[m]) + Float::abs(d[m + 1]);
+                if compare(test, test + Float::abs(e[m])) {
                     break; // convergence = true;
                 }
                 m += 1;
@@ -1063,7 +1068,7 @@ fn ritvec<T: SvdFloat>(
         - (T::from_usize(A.nnz()).unwrap()
             / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
 
-    let epsilon = T::epsilon();
+    let epsilon = <T as Float>::epsilon();
     let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
         // For very sparse matrices (>99%), use a more relaxed tolerance
         epsilon * T::from_f64(100.0).unwrap()
@@ -1117,7 +1122,7 @@ fn ritvec<T: SvdFloat>(
     let max_eigenvalue = Vt
         .value
         .iter()
-        .fold(T::zero(), |max, &val| max.max(val.abs()));
+        .fold(T::zero(), |max, &val| Float::max(max, Float::abs(val)));
 
     let adaptive_kappa = if sparsity > T::from_f64(0.99).unwrap() {
         // More relaxed kappa for very sparse matrices
@@ -1134,7 +1139,7 @@ fn ritvec<T: SvdFloat>(
         .into_par_iter()
         .filter(|&k| {
             let relative_bound =
-                adaptive_kappa * wrk.ritz[k].abs().max(max_eigenvalue * adaptive_eps);
+                adaptive_kappa * Float::max(Float::abs(wrk.ritz[k]), max_eigenvalue * adaptive_eps);
             wrk.bnd[k] <= relative_bound && k + 1 > js - neig
         })
         .collect();
@@ -1149,7 +1154,7 @@ fn ritvec<T: SvdFloat>(
             for i in 0..js {
                 let idx = k * js + i;
 
-                if s[idx].abs() > adaptive_eps {
+                if Float::abs(s[idx]) > adaptive_eps {
                     for (j, item) in store_vectors[i].iter().enumerate().take(wrk.ncols) {
                         vec[j] += s[idx] * *item;
                     }
@@ -1212,7 +1217,7 @@ fn ritvec<T: SvdFloat>(
 
             // Compute singular value
             let t = svd_ddot(vt_vec, tmp_vec);
-            let sval = t.max(T::zero()).sqrt();
+            let sval = Float::max(t, T::zero()).sqrt();
 
             (i, sval)
         })
@@ -1227,7 +1232,7 @@ fn ritvec<T: SvdFloat>(
         if sval > adaptive_eps {
             svd_dscal(T::one() / sval, &mut ut_vec);
         } else {
-            let dls = sval.max(adaptive_eps);
+            let dls = Float::max(sval, adaptive_eps);
             let safe_scale = T::one() / dls;
             svd_dscal(safe_scale, &mut ut_vec);
         }
@@ -1281,7 +1286,7 @@ fn lanso<T: SvdFloat>(
         Some(50)
     };
 
-    let epsilon = T::epsilon();
+    let epsilon = <T as Float>::epsilon();
     let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
         // For very sparse matrices (>99%), use a more relaxed tolerance
         epsilon * T::from_f64(100.0).unwrap()
@@ -1344,7 +1349,7 @@ fn lanso<T: SvdFloat>(
 
             let mut i = l;
             while i <= j {
-                if wrk.bet[i + 1].abs() <= adaptive_eps {
+                if Float::abs(wrk.bet[i + 1]) <= adaptive_eps {
                     break;
                 }
                 i += 1;
@@ -1365,7 +1370,7 @@ fn lanso<T: SvdFloat>(
             )?;
 
             for m in l..=i {
-                wrk.bnd[m] = rnm * wrk.bnd[m].abs();
+                wrk.bnd[m] = rnm * Float::abs(wrk.bnd[m]);
             }
             l = i + 1;
         }
@@ -1406,18 +1411,43 @@ impl<T: SvdFloat + 'static> SvdRec<T> {
     }
 }
 
-#[rustfmt::skip]
 impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csc::CscMatrix<T> {
-    fn nrows(&self) -> usize { self.nrows() }
-    fn ncols(&self) -> usize { self.ncols() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn nrows(&self) -> usize {
+        self.nrows()
+    }
+    fn ncols(&self) -> usize {
+        self.ncols()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 
     /// takes an n-vector x and returns A*x in y
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
-        let nrows = if transposed { self.ncols() } else { self.nrows() };
-        let ncols = if transposed { self.nrows() } else { self.ncols() };
-        assert_eq!(x.len(), ncols, "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}", x.len(), ncols);
-        assert_eq!(y.len(), nrows, "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}", y.len(), nrows);
+        let nrows = if transposed {
+            self.ncols()
+        } else {
+            self.nrows()
+        };
+        let ncols = if transposed {
+            self.nrows()
+        } else {
+            self.ncols()
+        };
+        assert_eq!(
+            x.len(),
+            ncols,
+            "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}",
+            x.len(),
+            ncols
+        );
+        assert_eq!(
+            y.len(),
+            nrows,
+            "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}",
+            y.len(),
+            nrows
+        );
 
         let (major_offsets, minor_indices, values) = self.csc_data();
 
@@ -1439,21 +1469,52 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
             }
         }
     }
+
+    fn compute_column_means(&self) -> Vec<T> {
+        todo!()
+    }
 }
 
-#[rustfmt::skip]
-impl<T: Float + Zero + AddAssign + Clone + Sync + Send> SMat<T> for nalgebra_sparse::csr::CsrMatrix<T> {
-    fn nrows(&self) -> usize { self.nrows() }
-    fn ncols(&self) -> usize { self.ncols() }
-    fn nnz(&self) -> usize { self.nnz() }
+impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign > SMat<T>
+    for nalgebra_sparse::csr::CsrMatrix<T>
+{
+    fn nrows(&self) -> usize {
+        self.nrows()
+    }
+    fn ncols(&self) -> usize {
+        self.ncols()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 
     /// takes an n-vector x and returns A*x in y
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
         //TODO parallelize me please
-        let nrows = if transposed { self.ncols() } else { self.nrows() };
-        let ncols = if transposed { self.nrows() } else { self.ncols() };
-        assert_eq!(x.len(), ncols, "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}", x.len(), ncols);
-        assert_eq!(y.len(), nrows, "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}", y.len(), nrows);
+        let nrows = if transposed {
+            self.ncols()
+        } else {
+            self.nrows()
+        };
+        let ncols = if transposed {
+            self.nrows()
+        } else {
+            self.ncols()
+        };
+        assert_eq!(
+            x.len(),
+            ncols,
+            "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}",
+            x.len(),
+            ncols
+        );
+        assert_eq!(
+            y.len(),
+            nrows,
+            "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}",
+            y.len(),
+            nrows
+        );
 
         let (major_offsets, minor_indices, values) = self.csr_data();
 
@@ -1471,9 +1532,9 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send> SMat<T> for nalgebra_spa
                     for j in major_offsets[i]..major_offsets[i + 1] {
                         sum += values[j] * x[minor_indices[j]];
                     }
-                (i, sum)
-            })
-            .collect();
+                    (i, sum)
+                })
+                .collect();
 
             // Apply the results to y
             for (i, val) in results {
@@ -1481,40 +1542,63 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send> SMat<T> for nalgebra_spa
             }
         } else {
             let nrows = self.nrows();
-        let chunk_size = crate::utils::determine_chunk_size(nrows);
+            let chunk_size = crate::utils::determine_chunk_size(nrows);
 
-        // Process input in chunks and create partial results
-        let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * chunk_size;
-                let end = (start + chunk_size).min(nrows);
+            // Process input in chunks and create partial results
+            let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(nrows);
 
-                let mut local_y = vec![T::zero(); y.len()];
-                for i in start..end {
-                    let row_val = x[i];
-                    for j in major_offsets[i]..major_offsets[i + 1] {
-                        let col = minor_indices[j];
-                        local_y[col] += values[j] * row_val;
+                    let mut local_y = vec![T::zero(); y.len()];
+                    for i in start..end {
+                        let row_val = x[i];
+                        for j in major_offsets[i]..major_offsets[i + 1] {
+                            let col = minor_indices[j];
+                            local_y[col] += values[j] * row_val;
+                        }
                     }
-                }
-                local_y
-            })
-            .collect();
+                    local_y
+                })
+                .collect();
 
-        // Combine partial results
-        for local_y in results {
-            for (idx, val) in local_y.iter().enumerate() {
-                if !val.is_zero() {
-                    y[idx] += *val;
+            // Combine partial results
+            for local_y in results {
+                for (idx, val) in local_y.iter().enumerate() {
+                    if !val.is_zero() {
+                        y[idx] += *val;
+                    }
                 }
             }
         }
+    }
+
+    fn compute_column_means(&self) -> Vec<T> {
+        let rows = self.nrows();
+        let cols = self.ncols();
+        let row_count_recip = T::one() / T::from(rows).unwrap();
+
+        let mut col_sums = vec![T::zero(); cols];
+        let (row_offsets, col_indices, values) = self.csr_data();
+
+        // Directly accumulate column sums from sparse representation
+        for i in 0..rows {
+            for j in row_offsets[i]..row_offsets[i + 1] {
+                let col = col_indices[j];
+                col_sums[col] += values[j];
+            }
         }
+
+        // Convert to means
+        for j in 0..cols {
+            col_sums[j] *= row_count_recip;
+        }
+
+        col_sums
     }
 }
 
-#[rustfmt::skip]
 impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
     fn nrows(&self) -> usize { self.nrows() }
     fn ncols(&self) -> usize { self.ncols() }
@@ -1540,5 +1624,9 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
                 y[i] += *v * x[j];
             }
         }
+    }
+
+    fn compute_column_means(&self) -> Vec<T> {
+        todo!()
     }
 }

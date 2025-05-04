@@ -45,11 +45,11 @@ where
     let rank = target_rank.min(m_rows.min(m_cols));
     let l = rank + n_oversamples;
 
-    let column_means = if mean_center {
+    let column_means: Option<DVector<T>> = if mean_center {
         if verbose {
             println!("SVD | Randomized | Computing column means....");
         }
-        compute_column_means(m)
+        Some(DVector::from(m.compute_column_means()))
     } else {
         None
     };
@@ -466,7 +466,7 @@ pub fn svd_flip<T: SvdFloat + 'static>(
             let mut max_idx = 0;
 
             for i in 0..nrows {
-                let abs_val = u[(i, j)].abs();
+                let abs_val = num_traits::Float::abs(u[(i, j)]);
                 if abs_val > max_abs {
                     max_abs = abs_val;
                     max_idx = i;
@@ -512,7 +512,7 @@ pub fn svd_flip<T: SvdFloat + 'static>(
             let mut max_idx = 0;
 
             for j in 0..ncols {
-                let abs_val = v[(i, j)].abs();
+                let abs_val = num_traits::Float::abs(v[(i, j)]);
                 if abs_val > max_abs {
                     max_abs = abs_val;
                     max_idx = j;
@@ -561,21 +561,21 @@ fn multiply_matrix_centered<T: SvdFloat, M: SMat<T>>(
     let cols = dense.ncols();
     let dense_rows = dense.nrows();
     let result_rows = result.nrows();
-    
+
     let results: Vec<(usize, Vec<T>)> = (0..cols)
         .into_par_iter()
         .map(|j| {
             let mut col_vec = vec![T::zero(); dense_rows];
             let mut result_vec = vec![T::zero(); result_rows];
-            
+
             for i in 0..dense_rows {
                 col_vec[i] = dense[(i, j)];
             }
-            
+
             let col_sum = col_vec.iter().fold(T::zero(), |acc, &val| acc + val);
-            
+
             sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
-            
+
             if !transpose_sparse {
                 for i in 0..result_rows {
                     let mean_adjustment = means.iter().map(|&mean| mean * col_sum).sum();
@@ -590,7 +590,7 @@ fn multiply_matrix_centered<T: SvdFloat, M: SMat<T>>(
             (j, result_vec)
         })
         .collect();
-    
+
     for (j, col_result) in results {
         for i in 0..result_rows {
             result[(i, j)] = col_result[i];
