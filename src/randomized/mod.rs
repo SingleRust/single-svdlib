@@ -10,6 +10,7 @@ use rand_distr::Normal;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator};
 use std::ops::Mul;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PowerIterationNormalizer {
@@ -30,12 +31,14 @@ pub fn randomized_svd<T, M>(
     power_iteration_normalizer: PowerIterationNormalizer,
     mean_center: bool,
     seed: Option<u64>,
+    verbose: bool,
 ) -> anyhow::Result<SvdRec<T>>
 where
     T: SvdFloat + RealField,
     M: SMat<T>,
     T: ComplexField,
 {
+    let start = Instant::now();
     let m_rows = m.nrows();
     let m_cols = m.ncols();
 
@@ -43,21 +46,54 @@ where
     let l = rank + n_oversamples;
 
     let column_means = if mean_center {
+        if verbose {
+            println!("SVD | Randomized | Computing column means....");
+        }
         compute_column_means(m)
     } else {
         None
     };
+    if verbose && mean_center {
+        println!(
+            "SVD | Randomized | Computed column means, took: {:?} of total running time",
+            start.elapsed()
+        );
+    }
 
-    let mut omega = generate_random_matrix(m_cols, l, seed);
+    let omega = generate_random_matrix(m_cols, l, seed);
 
     let mut y = DMatrix::<T>::zeros(m_rows, l);
+    if verbose {
+        println!("SVD | Randomized | Multiplying m with omega matrix....");
+    }
     multiply_matrix_centered(m, &omega, &mut y, false, &column_means);
-
+    if verbose {
+        println!(
+            "SVD | Randomized | Multiplication done, took: {:?} of total running time",
+            start.elapsed()
+        );
+    }
+    if verbose {
+        println!("SVD | Randomized | Starting power iterations....");
+    }
     if n_power_iters > 0 {
         let mut z = DMatrix::<T>::zeros(m_cols, l);
 
-        for _ in 0..n_power_iters {
+        for i in 0..n_power_iters {
+            if verbose {
+                println!(
+                    "SVD | Randomized | Running power-iteration: {:?}, current time: {:?}",
+                    i,
+                    start.elapsed()
+                );
+            }
             multiply_matrix_centered(m, &y, &mut z, true, &column_means);
+            if verbose {
+                println!(
+                    "SVD | Randomized | Forward Multiplication {:?}",
+                    start.elapsed()
+                );
+            }
             match power_iteration_normalizer {
                 PowerIterationNormalizer::QR => {
                     let qr = z.qr();
@@ -68,8 +104,20 @@ where
                 }
                 PowerIterationNormalizer::None => {}
             }
+            if verbose {
+                println!(
+                    "SVD | Randomized | Power Iteration Normalization Forward-Step {:?}",
+                    start.elapsed()
+                );
+            }
 
             multiply_matrix_centered(m, &z, &mut y, false, &column_means);
+            if verbose {
+                println!(
+                    "SVD | Randomized | Backward Multiplication {:?}",
+                    start.elapsed()
+                );
+            }
             match power_iteration_normalizer {
                 PowerIterationNormalizer::QR => {
                     let qr = y.qr();
@@ -78,15 +126,44 @@ where
                 PowerIterationNormalizer::LU => normalize_columns(&mut y),
                 PowerIterationNormalizer::None => {}
             }
+            if verbose {
+                println!(
+                    "SVD | Randomized | Power Iteration Normalization Backward-Step {:?}",
+                    start.elapsed()
+                );
+            }
         }
     }
-
+    if verbose {
+        println!(
+            "SVD | Randomized | Running QR-Normalization after Power-Iterations {:?}",
+            start.elapsed()
+        );
+    }
     let qr = y.qr();
     let y = qr.q();
+    if verbose {
+        println!(
+            "SVD | Randomized | Finished QR-Normalization after Power-Iterations {:?}",
+            start.elapsed()
+        );
+    }
 
     let mut b = DMatrix::<T>::zeros(y.ncols(), m_cols);
     multiply_transposed_by_matrix_centered(&y, m, &mut b, &column_means);
+    if verbose {
+        println!(
+            "SVD | Randomized | Transposed Matrix Multiplication {:?}",
+            start.elapsed()
+        );
+    }
     let svd = b.svd(true, true);
+    if verbose {
+        println!(
+            "SVD | Randomized | Running Singular Value Decomposition, took {:?}",
+            start.elapsed()
+        );
+    }
     let u_b = svd
         .u
         .ok_or_else(|| SvdLibError::Las2Error("SVD U computation failed".to_string()))?;
@@ -136,31 +213,28 @@ fn convert_singular_values<T: SvdFloat + ComplexField>(
 
 fn compute_column_means<T, M>(m: &M) -> Option<DVector<T>>
 where
-    T: SvdFloat + RealField,
-    M: SMat<T>,
+    T: SvdFloat + RealField + Send + Sync,
+    M: SMat<T> + Sync,
 {
     let m_rows = m.nrows();
     let m_cols = m.ncols();
 
-    let mut means = DVector::zeros(m_cols);
+    let means: Vec<T> = (0..m_cols)
+        .into_par_iter()
+        .map(|j| {
+            let mut col_vec = vec![T::zero(); m_cols];
+            let mut result_vec = vec![T::zero(); m_rows];
 
-    for j in 0..m_cols {
-        let mut col_vec = vec![T::zero(); m_cols];
-        let mut result_vec = vec![T::zero(); m_rows];
+            col_vec[j] = T::one();
 
-        col_vec[j] = T::one();
+            m.svd_opa(&col_vec, &mut result_vec, false);
 
-        m.svd_opa(&col_vec, &mut result_vec, false);
+            let sum: T = result_vec.iter().copied().sum();
+            sum / T::from_f64(m_rows as f64).unwrap()
+        })
+        .collect();
 
-        let mut sum = T::zero();
-        for &val in &result_vec {
-            sum += val;
-        }
-
-        means[j] = sum / T::from_f64(m_rows as f64).unwrap();
-    }
-
-    Some(means)
+    Some(DVector::from_vec(means))
 }
 
 fn create_diagnostics<T, M: SMat<T>>(
@@ -485,49 +559,40 @@ fn multiply_matrix_centered<T: SvdFloat, M: SMat<T>>(
 
     let means = column_means.as_ref().unwrap();
     let cols = dense.ncols();
-
+    let dense_rows = dense.nrows();
+    let result_rows = result.nrows();
+    
     let results: Vec<(usize, Vec<T>)> = (0..cols)
         .into_par_iter()
         .map(|j| {
-            let mut col_vec = vec![T::zero(); dense.nrows()];
-            let mut result_vec = vec![T::zero(); result.nrows()];
-
-            for i in 0..dense.nrows() {
+            let mut col_vec = vec![T::zero(); dense_rows];
+            let mut result_vec = vec![T::zero(); result_rows];
+            
+            for i in 0..dense_rows {
                 col_vec[i] = dense[(i, j)];
             }
-
+            
+            let col_sum = col_vec.iter().fold(T::zero(), |acc, &val| acc + val);
+            
             sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
-
+            
             if !transpose_sparse {
-                let mut dot_product = T::zero();
-                for &val in &col_vec {
-                    dot_product += val;
-                }
-
-                for i in 0..result_vec.len() {
-                    for (j, &mean) in means.iter().enumerate() {
-                        if !transpose_sparse {
-                            result_vec[i] -= mean * dot_product;
-                        }
-                    }
+                for i in 0..result_rows {
+                    let mean_adjustment = means.iter().map(|&mean| mean * col_sum).sum();
+                    result_vec[i] -= mean_adjustment;
                 }
             } else {
-                let mut sum_x = T::zero();
-                for &val in &col_vec {
-                    sum_x += val;
-                }
-
-                for (i, mean) in means.iter().enumerate() {
-                    result_vec[i] -= *mean * sum_x;
+                for (i, &mean) in means.iter().enumerate() {
+                    result_vec[i] -= mean * col_sum;
                 }
             }
 
             (j, result_vec)
         })
         .collect();
-
+    
     for (j, col_result) in results {
-        for i in 0..result.nrows() {
+        for i in 0..result_rows {
             result[(i, j)] = col_result[i];
         }
     }
@@ -706,6 +771,7 @@ mod randomized_svd_tests {
             PowerIterationNormalizer::QR,
             false,
             Some(42),
+            true,
         )
         .unwrap();
 
@@ -792,11 +858,29 @@ mod randomized_svd_tests {
 
         let csr = CsrMatrix::from(&coo);
 
-        let svd_no_center =
-            randomized_svd(&csr, 3, 3, 2, PowerIterationNormalizer::QR, false, Some(42)).unwrap();
+        let svd_no_center = randomized_svd(
+            &csr,
+            3,
+            3,
+            2,
+            PowerIterationNormalizer::QR,
+            false,
+            Some(42),
+            false,
+        )
+        .unwrap();
 
-        let svd_with_center =
-            randomized_svd(&csr, 3, 3, 2, PowerIterationNormalizer::QR, true, Some(42)).unwrap();
+        let svd_with_center = randomized_svd(
+            &csr,
+            3,
+            3,
+            2,
+            PowerIterationNormalizer::QR,
+            true,
+            Some(42),
+            false,
+        )
+        .unwrap();
 
         println!("Singular values without centering: {:?}", svd_no_center.s);
         println!("Singular values with centering: {:?}", svd_with_center.s);
@@ -818,6 +902,7 @@ mod randomized_svd_tests {
             PowerIterationNormalizer::QR,
             false,
             Some(42),
+            false,
         );
 
         assert!(
@@ -896,6 +981,7 @@ mod randomized_svd_tests {
                 PowerIterationNormalizer::QR,
                 false,
                 Some(42),
+                false,
             )
             .unwrap();
 

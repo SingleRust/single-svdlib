@@ -178,6 +178,7 @@ mod simple_comparison_tests {
             randomized::PowerIterationNormalizer::QR,
             false,
             Some(42),
+            false
         );
 
         // Verify the computation succeeds on a highly sparse matrix
@@ -231,7 +232,8 @@ mod simple_comparison_tests {
                 7,                               // power iterations
                 randomized::PowerIterationNormalizer::QR,    // use QR normalization
                 false,
-                Some(42),                        // random seed
+                Some(42),
+                false// random seed
             )
         });
 
@@ -264,6 +266,7 @@ mod simple_comparison_tests {
                 randomized::PowerIterationNormalizer::QR,    // use QR normalization
                 false,
                 Some(42),                        // random seed
+                false
             )
         });
 

@@ -1,9 +1,10 @@
+use rayon::iter::IndexedParallelIterator;
 use crate::utils::determine_chunk_size;
 use crate::{SMat, SvdFloat};
 use nalgebra_sparse::CsrMatrix;
 use num_traits::Float;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{IntoParallelIterator, ParallelBridge};
+use rayon::prelude::{IntoParallelIterator, ParallelBridge, ParallelSliceMut};
 use std::ops::AddAssign;
 
 pub struct MaskedCSRMatrix<'a, T: Float> {
@@ -86,7 +87,6 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
     }
 
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
-        // TODO  parallelize me please
         let nrows = if transposed {
             self.ncols()
         } else {
@@ -117,92 +117,86 @@ impl<'a, T: Float + AddAssign + Sync + Send> SMat<T> for MaskedCSRMatrix<'a, T> 
 
         y.fill(T::zero());
 
-        let high_precision_mode = self.ensure_identical_results_mode();
-
         if !transposed {
-            if high_precision_mode && self.uses_all_columns() {
-                // For small matrices using all columns, mimic the exact behavior of
-                // the original implementation to ensure identical results
-                for i in 0..self.matrix.nrows() {
-                    let mut sum = T::zero();
-                    for j in major_offsets[i]..major_offsets[i + 1] {
-                        let col = minor_indices[j];
-                        // For all-columns mode, we know all columns are included
-                        let masked_col = self.original_to_masked[col].unwrap();
-                        sum = sum + (values[j] * x[masked_col]);
-                    }
-                    y[i] = sum;
-                }
-            } else {
-                let chunk_size = determine_chunk_size(self.matrix.nrows());
-                y.chunks_mut(chunk_size).enumerate().par_bridge().for_each(
-                    |(chunk_idx, y_chunk)| {
-                        let start_row = chunk_idx * chunk_size;
-                        let end_row = (start_row + y_chunk.len()).min(self.matrix.nrows());
-
-                        for i in start_row..end_row {
-                            let row_idx = i - start_row;
-                            let mut sum = T::zero();
-
-                            for j in major_offsets[i]..major_offsets[i + 1] {
-                                let col = minor_indices[j];
-                                if let Some(masked_col) = self.original_to_masked[col] {
-                                    sum += values[j] * x[masked_col];
-                                };
-                            }
-                            y_chunk[row_idx] = sum;
-                        }
-                    },
-                );
+            // A * x calculation
+            let row_count = self.matrix.nrows();
+            let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+            
+            let chunk_size = std::cmp::max(16, row_count / (rayon::current_num_threads() * 2));
+            
+            let mut valid_indices = Vec::with_capacity(self.matrix.ncols());
+            for col in 0..self.matrix.ncols() {
+                valid_indices.push(self.original_to_masked[col]);
             }
-        } else {
-            // For the transposed case (A^T * x)
-            if high_precision_mode && self.uses_all_columns() {
-                // Clear the output vector first
-                for yval in y.iter_mut() {
-                    *yval = T::zero();
-                }
-
-                // Follow exact same order of operations as original implementation
-                for i in 0..self.matrix.nrows() {
-                    let row_val = x[i];
-                    for j in major_offsets[i]..major_offsets[i + 1] {
-                        let col = minor_indices[j];
-                        let masked_col = self.original_to_masked[col].unwrap();
-                        y[masked_col] = y[masked_col] + (values[j] * row_val);
-                    }
-                }
-            } else {
-                let nrows = self.matrix.nrows();
-                let chunk_size = determine_chunk_size(nrows);
-                let num_chunks = (nrows + chunk_size - 1) / chunk_size;
-                let results: Vec<Vec<T>> = (0..chunk_size)
-                    .into_par_iter()
-                    .map(|chunk_idx| {
-                        let start = chunk_idx * chunk_size;
-                        let end = (start + chunk_size).min(nrows);
-
-                        let mut local_y = vec![T::zero(); y.len()];
-                        for i in start..end {
-                            let row_val = x[i];
-                            for j in major_offsets[i]..major_offsets[i + 1] {
-                                let col = minor_indices[j];
-                                if let Some(masked_col) = self.original_to_masked[col] {
-                                    local_y[masked_col] += values[j] * row_val;
+            
+            y.par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, y_chunk)| {
+                    let start_row = chunk_idx * chunk_size;
+                    let end_row = (start_row + y_chunk.len()).min(row_count);
+                    
+                    for i in start_row..end_row {
+                        let row_idx = i - start_row;
+                        let mut sum = T::zero();
+                        
+                        let row_start = major_offsets[i];
+                        let row_end = major_offsets[i + 1];
+                        
+                        let mut j = row_start;
+                        
+                        while j + 4 <= row_end {
+                            for offset in 0..4 {
+                                let idx = j + offset;
+                                let col = minor_indices[idx];
+                                if let Some(masked_col) = valid_indices[col] {
+                                    sum += values[idx] * x[masked_col];
                                 }
                             }
+                            j += 4;
                         }
-                        local_y
-                    })
-                    .collect();
-
-                y.fill(T::zero());
-
-                for local_y in results {
-                    for (idx, val) in local_y.iter().enumerate() {
-                        if !val.is_zero() {
-                            y[idx] += *val;
+                        
+                        while j < row_end {
+                            let col = minor_indices[j];
+                            if let Some(masked_col) = valid_indices[col] {
+                                sum += values[j] * x[masked_col];
+                            }
+                            j += 1;
                         }
+
+                        y_chunk[row_idx] = sum;
+                    }
+                });
+        } else {
+            // A^T * x calculation
+            let nrows = self.matrix.nrows();
+            let chunk_size = determine_chunk_size(nrows);
+
+            // Process in parallel chunks
+            let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(nrows);
+
+                    let mut local_y = vec![T::zero(); y.len()];
+                    for i in start..end {
+                        let row_val = x[i];
+                        for j in major_offsets[i]..major_offsets[i + 1] {
+                            let col = minor_indices[j];
+                            if let Some(masked_col) = self.original_to_masked[col] {
+                                local_y[masked_col] += values[j] * row_val;
+                            }
+                        }
+                    }
+                    local_y
+                })
+                .collect();
+
+            // Combine results
+            for local_y in results {
+                for (idx, val) in local_y.iter().enumerate() {
+                    if !val.is_zero() {
+                        y[idx] += *val;
                     }
                 }
             }
