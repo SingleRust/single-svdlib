@@ -401,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "single-utilities"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db8bf1e3c46048bf3ea4708ba25283911de99dab71ef11fd83016d695f114636"
+checksum = "e4f8fbd4ea3fc4e4676a2a7dc5f4e09cdd72d3f4e10c32a8dedade130adb62ab"
 dependencies = [
  "num-traits",
 ]
