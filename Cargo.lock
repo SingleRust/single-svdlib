@@ -141,6 +141,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
+ "rayon",
  "simba",
  "typenum",
 ]
@@ -385,9 +386,10 @@ dependencies = [
 
 [[package]]
 name = "single-svdlib"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
+ "nalgebra",
  "nalgebra-sparse",
  "ndarray",
  "nshare",

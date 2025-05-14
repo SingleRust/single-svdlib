@@ -1,10 +1,13 @@
-use crate::utils::determine_chunk_size;
-use crate::{SMat, SvdFloat};
+use crate::{determine_chunk_size, SMat, SvdFloat};
+use nalgebra_sparse::na::{DMatrix, DVector};
 use nalgebra_sparse::CsrMatrix;
 use num_traits::Float;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{IntoParallelIterator, ParallelBridge, ParallelSliceMut};
+use rayon::prelude::{
+    IntoParallelIterator, IntoParallelRefIterator, ParallelBridge, ParallelSliceMut,
+};
+use std::fmt::Debug;
 use std::ops::AddAssign;
 
 pub struct MaskedCSRMatrix<'a, T: Float> {
@@ -62,7 +65,20 @@ impl<'a, T: Float> MaskedCSRMatrix<'a, T> {
     }
 }
 
-impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for MaskedCSRMatrix<'a, T> {
+impl<
+        'a,
+        T: Float
+            + AddAssign
+            + Sync
+            + Send
+            + std::ops::MulAssign
+            + Debug
+            + 'static
+            + std::iter::Sum
+            + std::ops::SubAssign
+            + num_traits::FromPrimitive,
+    > SMat<T> for MaskedCSRMatrix<'a, T>
+{
     fn nrows(&self) -> usize {
         self.matrix.nrows()
     }
@@ -115,35 +131,47 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
 
         let (major_offsets, minor_indices, values) = self.matrix.csr_data();
 
+        if self.uses_all_columns() || (self.matrix.nrows() < 1000 && self.matrix.ncols() < 1000) {
+            // Fast path for unmasked matrices or small matrices
+            if !transposed {
+                // A * x calculation
+                self.matrix.svd_opa(x, y, false);
+            } else {
+                // A^T * x calculation
+                self.matrix.svd_opa(x, y, true);
+            }
+            return;
+        }
+
         y.fill(T::zero());
 
         if !transposed {
             // A * x calculation
-            let row_count = self.matrix.nrows();
-            let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+            let valid_indices: Vec<Option<usize>> = (0..self.matrix.ncols())
+                .map(|col| self.original_to_masked[col])
+                .collect();
 
-            let chunk_size = std::cmp::max(16, row_count / (rayon::current_num_threads() * 2));
+            // Parallelization parameters
+            let rows = self.matrix.nrows();
+            let chunk_size = std::cmp::max(16, rows / (rayon::current_num_threads() * 2));
 
-            let mut valid_indices = Vec::with_capacity(self.matrix.ncols());
-            for col in 0..self.matrix.ncols() {
-                valid_indices.push(self.original_to_masked[col]);
-            }
-
+            // Process in parallel chunks
             y.par_chunks_mut(chunk_size)
                 .enumerate()
                 .for_each(|(chunk_idx, y_chunk)| {
                     let start_row = chunk_idx * chunk_size;
-                    let end_row = (start_row + y_chunk.len()).min(row_count);
+                    let end_row = (start_row + y_chunk.len()).min(rows);
 
                     for i in start_row..end_row {
                         let row_idx = i - start_row;
                         let mut sum = T::zero();
 
+                        // Process row in blocks of 16 elements for better vectorization
                         let row_start = major_offsets[i];
                         let row_end = major_offsets[i + 1];
 
+                        // Unroll the loop by 4 for better instruction-level parallelism
                         let mut j = row_start;
-
                         while j + 4 <= row_end {
                             for offset in 0..4 {
                                 let idx = j + offset;
@@ -155,6 +183,7 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
                             j += 4;
                         }
 
+                        // Handle remaining elements
                         while j < row_end {
                             let col = minor_indices[j];
                             if let Some(masked_col) = valid_indices[col] {
@@ -169,18 +198,23 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
         } else {
             // A^T * x calculation
             let nrows = self.matrix.nrows();
-            let chunk_size = determine_chunk_size(nrows);
+            let chunk_size = crate::utils::determine_chunk_size(nrows);
 
-            // Process in parallel chunks
-            let results: Vec<Vec<T>> = (0..((nrows + chunk_size - 1) / chunk_size))
+            // Create thread-local partial results and combine at the end
+            let results: Vec<Vec<T>> = (0..nrows.div_ceil(chunk_size))
                 .into_par_iter()
                 .map(|chunk_idx| {
                     let start = chunk_idx * chunk_size;
                     let end = (start + chunk_size).min(nrows);
-
                     let mut local_y = vec![T::zero(); y.len()];
+
+                    // Process a chunk of rows
                     for i in start..end {
                         let row_val = x[i];
+                        if row_val.is_zero() {
+                            continue; // Skip zero values for performance
+                        }
+
                         for j in major_offsets[i]..major_offsets[i + 1] {
                             let col = minor_indices[j];
                             if let Some(masked_col) = self.original_to_masked[col] {
@@ -192,11 +226,12 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
                 })
                 .collect();
 
-            // Combine results
+            // Combine results efficiently
             for local_y in results {
-                for (idx, val) in local_y.iter().enumerate() {
+                // Only update non-zero elements to reduce memory traffic
+                for (idx, &val) in local_y.iter().enumerate() {
                     if !val.is_zero() {
-                        y[idx] += *val;
+                        y[idx] += val;
                     }
                 }
             }
@@ -210,7 +245,7 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
 
         let mut col_sums = vec![T::zero(); masked_cols];
         let (row_offsets, col_indices, values) = self.matrix.csr_data();
-        
+
         for i in 0..rows {
             for j in row_offsets[i]..row_offsets[i + 1] {
                 let original_col = col_indices[j];
@@ -226,6 +261,266 @@ impl<'a, T: Float + AddAssign + Sync + Send + std::ops::MulAssign> SMat<T> for M
         }
 
         col_sums
+    }
+
+    fn multiply_with_dense(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+    ) {
+        let m_rows = if transpose_self {
+            self.ncols()
+        } else {
+            self.nrows()
+        };
+        let m_cols = if transpose_self {
+            self.nrows()
+        } else {
+            self.ncols()
+        };
+
+        assert_eq!(
+            dense.nrows(),
+            m_cols,
+            "Dense matrix has incompatible row count"
+        );
+        assert_eq!(
+            result.nrows(),
+            m_rows,
+            "Result matrix has incompatible row count"
+        );
+        assert_eq!(
+            result.ncols(),
+            dense.ncols(),
+            "Result matrix has incompatible column count"
+        );
+
+        // Determine if we can use optimized path
+        //if self.ensure_identical_results_mode() {
+        // For small matrices, use the default implementation
+        //    return <Self as SMat<T>>::multiply_matrix(self, dense, result, transpose_self);
+        //}
+
+        let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+
+        if !transpose_self {
+            let rows = self.matrix.nrows();
+            let dense_cols = dense.ncols();
+
+            let partial_results: Vec<(usize, DMatrix<T>)> = (0..rows)
+                .into_par_iter()
+                .map(|row| {
+                    let mut local_result = DMatrix::<T>::zeros(1, dense_cols);
+
+                    for j in major_offsets[row]..major_offsets[row + 1] {
+                        let col = minor_indices[j];
+                        if let Some(masked_col) = self.original_to_masked[col] {
+                            let val = values[j];
+
+                            for c in 0..dense_cols {
+                                local_result[(0, c)] += val * dense[(masked_col, c)];
+                            }
+                        }
+                    }
+
+                    (row, local_result)
+                })
+                .collect();
+
+            for (row, local_result) in partial_results {
+                for c in 0..dense_cols {
+                    result[(row, c)] = local_result[(0, c)];
+                }
+            }
+        } else {
+            let nrows = self.matrix.nrows();
+            let ncols = self.ncols();
+            let dense_cols = dense.ncols();
+
+            let chunk_size = determine_chunk_size(nrows);
+
+            let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(nrows);
+
+                    let mut local_result = DMatrix::<T>::zeros(ncols, dense_cols);
+
+                    for i in start..end {
+                        for j in major_offsets[i]..major_offsets[i + 1] {
+                            let col = minor_indices[j];
+                            if let Some(masked_col) = self.original_to_masked[col] {
+                                let val = values[j];
+
+                                for c in 0..dense_cols {
+                                    local_result[(masked_col, c)] += val * dense[(i, c)];
+                                }
+                            }
+                        }
+                    }
+
+                    local_result
+                })
+                .collect();
+
+            for local_result in partial_results {
+                for r in 0..ncols {
+                    for c in 0..dense_cols {
+                        let val = local_result[(r, c)];
+                        if !val.is_zero() {
+                            result[(r, c)] += val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn multiply_with_dense_centered(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+        means: &DVector<T>,
+    ) {
+        let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+
+        // Pre-compute column sums for the dense matrix - do this once
+        let dense_cols = dense.ncols();
+        let dense_rows = dense.nrows();
+
+        // Pre-compute all column sums to avoid redundant calculations
+        let col_sums: Vec<T> = (0..dense_cols)
+            .into_par_iter()
+            .map(|c| (0..dense_rows).map(|i| dense[(i, c)]).sum())
+            .collect();
+
+        if !transpose_self {
+            let rows = self.matrix.nrows();
+
+            // Pre-compute mean adjustments for each column
+            let mean_adjustments: Vec<T> = col_sums
+                .iter()
+                .map(|&col_sum| {
+                    means
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(original_idx, &mean_val)| {
+                            self.original_to_masked
+                                .get(original_idx)
+                                .map(|_| mean_val * col_sum)
+                        })
+                        .sum()
+                })
+                .collect();
+
+            let chunk_size = std::cmp::max(16, rows / (rayon::current_num_threads() * 4));
+
+            let row_updates: Vec<(usize, Vec<T>)> = (0..rows)
+                .into_par_iter()
+                .map(|row| {
+                    let mut row_result = vec![T::zero(); dense_cols];
+
+                    for j in major_offsets[row]..major_offsets[row + 1] {
+                        let col = minor_indices[j];
+                        if let Some(masked_col) = self.original_to_masked[col] {
+                            let val = values[j];
+
+                            for c in 0..dense_cols {
+                                row_result[c] += val * dense[(masked_col, c)];
+                            }
+                        }
+                    }
+
+                    for c in 0..dense_cols {
+                        row_result[c] -= mean_adjustments[c];
+                    }
+
+                    (row, row_result)
+                })
+                .collect();
+
+            for (row, row_values) in row_updates {
+                for c in 0..dense_cols {
+                    result[(row, c)] = row_values[c];
+                }
+            }
+        } else {
+            let nrows = self.matrix.nrows();
+            let ncols = self.ncols();
+
+            // Clear the result matrix first
+            for i in 0..result.nrows() {
+                for j in 0..result.ncols() {
+                    result[(i, j)] = T::zero();
+                }
+            }
+
+            // Choose optimal chunk size
+            let chunk_size = determine_chunk_size(nrows);
+
+            // Compute partial results in parallel
+            let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = std::cmp::min(start + chunk_size, nrows);
+
+                    let mut local_result = DMatrix::<T>::zeros(ncols, dense_cols);
+
+                    for i in start..end {
+                        for j in major_offsets[i]..major_offsets[i + 1] {
+                            let col = minor_indices[j];
+                            if let Some(masked_col) = self.original_to_masked[col] {
+                                let sparse_val = values[j];
+
+                                for c in 0..dense_cols {
+                                    local_result[(masked_col, c)] += sparse_val * dense[(i, c)];
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply mean adjustment for this chunk
+                    let chunk_fraction =
+                        T::from_f64((end - start) as f64 / dense_rows as f64).unwrap();
+
+                    for masked_col in 0..ncols {
+                        if masked_col < means.len() {
+                            let mean = means[masked_col];
+                            for c in 0..dense_cols {
+                                local_result[(masked_col, c)] -=
+                                    mean * col_sums[c] * chunk_fraction;
+                            }
+                        }
+                    }
+
+                    local_result
+                })
+                .collect();
+
+            for local_result in partial_results {
+                const BLOCK_SIZE: usize = 32;
+
+                for r_block in 0..ncols.div_ceil(BLOCK_SIZE) {
+                    let r_start = r_block * BLOCK_SIZE;
+                    let r_end = std::cmp::min(r_start + BLOCK_SIZE, ncols);
+
+                    for c_block in 0..dense_cols.div_ceil(BLOCK_SIZE) {
+                        let c_start = c_block * BLOCK_SIZE;
+                        let c_end = std::cmp::min(c_start + BLOCK_SIZE, dense_cols);
+
+                        for r in r_start..r_end {
+                            for c in c_start..c_end {
+                                result[(r, c)] += local_result[(r, c)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

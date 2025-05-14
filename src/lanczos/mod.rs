@@ -2,6 +2,7 @@ pub mod masked;
 
 use crate::error::SvdLibError;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
+use nalgebra_sparse::na::{DMatrix, DVector};
 use ndarray::{Array, Array2};
 use num_traits::real::Real;
 use num_traits::{Float, FromPrimitive, One, Zero};
@@ -1473,9 +1474,28 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
     fn compute_column_means(&self) -> Vec<T> {
         todo!()
     }
+
+    fn multiply_with_dense(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+    ) {
+        todo!()
+    }
+
+    fn multiply_with_dense_centered(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+        means: &DVector<T>,
+    ) {
+        todo!()
+    }
 }
 
-impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign > SMat<T>
+impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SMat<T>
     for nalgebra_sparse::csr::CsrMatrix<T>
 {
     fn nrows(&self) -> usize {
@@ -1597,19 +1617,64 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign > S
 
         col_sums
     }
+
+    fn multiply_with_dense(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+    ) {
+        todo!()
+    }
+
+    fn multiply_with_dense_centered(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+        means: &DVector<T>,
+    ) {
+        todo!()
+    }
 }
 
 impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
-    fn nrows(&self) -> usize { self.nrows() }
-    fn ncols(&self) -> usize { self.ncols() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn nrows(&self) -> usize {
+        self.nrows()
+    }
+    fn ncols(&self) -> usize {
+        self.ncols()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 
     /// takes an n-vector x and returns A*x in y
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
-        let nrows = if transposed { self.ncols() } else { self.nrows() };
-        let ncols = if transposed { self.nrows() } else { self.ncols() };
-        assert_eq!(x.len(), ncols, "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}", x.len(), ncols);
-        assert_eq!(y.len(), nrows, "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}", y.len(), nrows);
+        let nrows = if transposed {
+            self.ncols()
+        } else {
+            self.nrows()
+        };
+        let ncols = if transposed {
+            self.nrows()
+        } else {
+            self.ncols()
+        };
+        assert_eq!(
+            x.len(),
+            ncols,
+            "svd_opa: x must be A.ncols() in length, x = {}, A.ncols = {}",
+            x.len(),
+            ncols
+        );
+        assert_eq!(
+            y.len(),
+            nrows,
+            "svd_opa: y must be A.nrows() in length, y = {}, A.nrows = {}",
+            y.len(),
+            nrows
+        );
 
         for y_val in y.iter_mut() {
             *y_val = T::zero();
@@ -1627,6 +1692,25 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
     }
 
     fn compute_column_means(&self) -> Vec<T> {
+        todo!()
+    }
+
+    fn multiply_with_dense(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+    ) {
+        todo!()
+    }
+
+    fn multiply_with_dense_centered(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+        means: &DVector<T>,
+    ) {
         todo!()
     }
 }
