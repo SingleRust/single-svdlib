@@ -4,7 +4,7 @@ description = "A Rust port of LAS2 from SVDLIBC"
 keywords = ["svd"]
 categories = ["algorithms", "data-structures", "mathematics", "science"]
 name = "single-svdlib"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 license-file = "SVDLIBC-LICENSE.txt"
 
@@ -19,3 +19,4 @@ thiserror = "2.0.9"
 nshare = {version = "0.10.0", features = ["nalgebra", "ndarray"] }
 ndarray = "0.16.1"
 single-utilities = "0.6.0"
+nalgebra = {version = "0.33.2", features = ["rayon"] }

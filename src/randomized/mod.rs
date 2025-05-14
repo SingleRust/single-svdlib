@@ -35,7 +35,7 @@ pub fn randomized_svd<T, M>(
 ) -> anyhow::Result<SvdRec<T>>
 where
     T: SvdFloat + RealField,
-    M: SMat<T>,
+    M: SMat<T> + std::marker::Sync,
     T: ComplexField,
 {
     let start = Instant::now();
@@ -344,32 +344,10 @@ fn multiply_matrix<T: SvdFloat, M: SMat<T>>(
     result: &mut DMatrix<T>,
     transpose_sparse: bool,
 ) {
-    let cols = dense.ncols();
-
-    let results: Vec<(usize, Vec<T>)> = (0..cols)
-        .into_par_iter()
-        .map(|j| {
-            let mut col_vec = vec![T::zero(); dense.nrows()];
-            let mut result_vec = vec![T::zero(); result.nrows()];
-
-            for i in 0..dense.nrows() {
-                col_vec[i] = dense[(i, j)];
-            }
-
-            sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
-
-            (j, result_vec)
-        })
-        .collect();
-
-    for (j, col_result) in results {
-        for i in 0..result.nrows() {
-            result[(i, j)] = col_result[i];
-        }
-    }
+    sparse.multiply_with_dense(dense, result, transpose_sparse)
 }
 
-fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T>>(
+fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
     q: &DMatrix<T>,
     sparse: &M,
     result: &mut DMatrix<T>,
@@ -545,7 +523,7 @@ pub fn svd_flip<T: SvdFloat + 'static>(
     Ok(())
 }
 
-fn multiply_matrix_centered<T: SvdFloat, M: SMat<T>>(
+fn multiply_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
     sparse: &M,
     dense: &DMatrix<T>,
     result: &mut DMatrix<T>,
@@ -558,52 +536,16 @@ fn multiply_matrix_centered<T: SvdFloat, M: SMat<T>>(
     }
 
     let means = column_means.as_ref().unwrap();
-    let cols = dense.ncols();
-    let dense_rows = dense.nrows();
-    let result_rows = result.nrows();
-
-    let results: Vec<(usize, Vec<T>)> = (0..cols)
-        .into_par_iter()
-        .map(|j| {
-            let mut col_vec = vec![T::zero(); dense_rows];
-            let mut result_vec = vec![T::zero(); result_rows];
-
-            for i in 0..dense_rows {
-                col_vec[i] = dense[(i, j)];
-            }
-
-            let col_sum = col_vec.iter().fold(T::zero(), |acc, &val| acc + val);
-
-            sparse.svd_opa(&col_vec, &mut result_vec, transpose_sparse);
-
-            if !transpose_sparse {
-                for i in 0..result_rows {
-                    let mean_adjustment = means.iter().map(|&mean| mean * col_sum).sum();
-                    result_vec[i] -= mean_adjustment;
-                }
-            } else {
-                for (i, &mean) in means.iter().enumerate() {
-                    result_vec[i] -= mean * col_sum;
-                }
-            }
-
-            (j, result_vec)
-        })
-        .collect();
-
-    for (j, col_result) in results {
-        for i in 0..result_rows {
-            result[(i, j)] = col_result[i];
-        }
-    }
+    sparse.multiply_with_dense_centered(dense, result, transpose_sparse, means)
 }
 
-fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T>>(
+fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
     q: &DMatrix<T>,
     sparse: &M,
     result: &mut DMatrix<T>,
     column_means: &Option<DVector<T>>,
 ) {
+    // TODO optimize me please
     if column_means.is_none() {
         multiply_transposed_by_matrix(q, sparse, result);
         return;

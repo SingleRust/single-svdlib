@@ -1,9 +1,10 @@
+use rayon::iter::ParallelIterator;
+use nalgebra_sparse::na::{DMatrix, DVector};
 use ndarray::{Array1, Array2};
-use num_traits::{Float, FromPrimitive, One, Zero};
-use std::fmt::Debug;
-use std::iter::Sum;
-use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
+use num_traits::{Float, Zero};
+use rayon::prelude::{IntoParallelIterator, IndexedParallelIterator};
 use single_utilities::traits::FloatOpsTS;
+use std::fmt::Debug;
 
 pub fn determine_chunk_size(nrows: usize) -> usize {
     let num_threads = rayon::current_num_threads();
@@ -17,13 +18,15 @@ pub fn determine_chunk_size(nrows: usize) -> usize {
     chunk_size.max(min_rows_per_thread)
 }
 
-pub trait SMat<T: Float>: Sync {
+pub trait SMat<T: Float> {
     fn nrows(&self) -> usize;
     fn ncols(&self) -> usize;
     fn nnz(&self) -> usize;
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
-    
     fn compute_column_means(&self) -> Vec<T>;
+    fn multiply_with_dense(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool);
+
+    fn multiply_with_dense_centered(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool, means: &DVector<T>);
 }
 
 /// Singular Value Decomposition Components
@@ -72,9 +75,7 @@ pub struct Diagnostics<T: Float> {
     pub random_seed: u32,
 }
 
-pub trait SvdFloat:
-    FloatOpsTS
-{
+pub trait SvdFloat: FloatOpsTS {
     fn eps() -> Self;
     fn eps34() -> Self;
     fn compare(a: Self, b: Self) -> bool;
