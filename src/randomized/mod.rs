@@ -211,32 +211,6 @@ fn convert_singular_values<T: SvdFloat + ComplexField>(
     array
 }
 
-fn compute_column_means<T, M>(m: &M) -> Option<DVector<T>>
-where
-    T: SvdFloat + RealField + Send + Sync,
-    M: SMat<T> + Sync,
-{
-    let m_rows = m.nrows();
-    let m_cols = m.ncols();
-
-    let means: Vec<T> = (0..m_cols)
-        .into_par_iter()
-        .map(|j| {
-            let mut col_vec = vec![T::zero(); m_cols];
-            let mut result_vec = vec![T::zero(); m_rows];
-
-            col_vec[j] = T::one();
-
-            m.svd_opa(&col_vec, &mut result_vec, false);
-
-            let sum: T = result_vec.iter().copied().sum();
-            sum / T::from_f64(m_rows as f64).unwrap()
-        })
-        .collect();
-
-    Some(DVector::from_vec(means))
-}
-
 fn create_diagnostics<T, M: SMat<T>>(
     a: &M,
     d: usize,
@@ -854,13 +828,13 @@ mod randomized_svd_tests {
 
         for i in 0..100 {
             for j in 0..10 {
-                u[i][j] = rng.gen_range(-1.0..1.0);
+                u[i][j] = rng.random_range(-1.0..1.0);
             }
         }
 
         for i in 0..50 {
             for j in 0..10 {
-                v[i][j] = rng.gen_range(-1.0..1.0);
+                v[i][j] = rng.random_range(-1.0..1.0);
             }
         }
 
@@ -870,7 +844,7 @@ mod randomized_svd_tests {
                 for k in 0..10 {
                     val += u[i][k] * v[j][k];
                 }
-                val += rng.gen_range(-0.01..0.01);
+                val += rng.random_range(-0.01..0.01);
                 coo.push(i, j, val);
             }
         }

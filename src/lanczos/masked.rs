@@ -66,7 +66,6 @@ impl<'a, T: Float> MaskedCSRMatrix<'a, T> {
 }
 
 impl<
-        'a,
         T: Float
             + AddAssign
             + Sync
@@ -77,7 +76,7 @@ impl<
             + std::iter::Sum
             + std::ops::SubAssign
             + num_traits::FromPrimitive,
-    > SMat<T> for MaskedCSRMatrix<'a, T>
+    > SMat<T> for MaskedCSRMatrix<'_, T>
 {
     fn nrows(&self) -> usize {
         self.matrix.nrows()
@@ -296,41 +295,67 @@ impl<
             "Result matrix has incompatible column count"
         );
 
-        // Determine if we can use optimized path
-        //if self.ensure_identical_results_mode() {
-        // For small matrices, use the default implementation
-        //    return <Self as SMat<T>>::multiply_matrix(self, dense, result, transpose_self);
-        //}
-
         let (major_offsets, minor_indices, values) = self.matrix.csr_data();
 
         if !transpose_self {
             let rows = self.matrix.nrows();
             let dense_cols = dense.ncols();
 
-            let partial_results: Vec<(usize, DMatrix<T>)> = (0..rows)
+            // Pre-filter valid column mappings to avoid repeated lookups
+            let valid_cols: Vec<Option<usize>> = (0..self.matrix.ncols())
+                .map(|col| self.original_to_masked.get(col).copied().flatten())
+                .collect();
+
+            // Compute results in parallel, then apply to result matrix
+            let row_results: Vec<(usize, Vec<T>)> = (0..rows)
                 .into_par_iter()
                 .map(|row| {
-                    let mut local_result = DMatrix::<T>::zeros(1, dense_cols);
+                    let mut row_result = vec![T::zero(); dense_cols];
 
-                    for j in major_offsets[row]..major_offsets[row + 1] {
+                    // Process sparse row with blocked inner loop for better vectorization
+                    let row_start = major_offsets[row];
+                    let row_end = major_offsets[row + 1];
+
+                    // Unroll the sparse elements loop by 4 for better ILP
+                    let mut j = row_start;
+                    while j + 4 <= row_end {
+                        // Process 4 sparse elements at once
+                        for offset in 0..4 {
+                            let idx = j + offset;
+                            let col = minor_indices[idx];
+                            if let Some(masked_col) = valid_cols[col] {
+                                let val = values[idx];
+
+                                // Vectorized dense column update
+                                for c in 0..dense_cols {
+                                    row_result[c] += val * dense[(masked_col, c)];
+                                }
+                            }
+                        }
+                        j += 4;
+                    }
+
+                    // Handle remaining elements
+                    while j < row_end {
                         let col = minor_indices[j];
-                        if let Some(masked_col) = self.original_to_masked[col] {
+                        if let Some(masked_col) = valid_cols[col] {
                             let val = values[j];
 
                             for c in 0..dense_cols {
-                                local_result[(0, c)] += val * dense[(masked_col, c)];
+                                row_result[c] += val * dense[(masked_col, c)];
                             }
                         }
+                        j += 1;
                     }
 
-                    (row, local_result)
+                    (row, row_result)
                 })
                 .collect();
 
-            for (row, local_result) in partial_results {
+            // Apply results to output matrix
+            for (row, row_values) in row_results {
                 for c in 0..dense_cols {
-                    result[(row, c)] = local_result[(0, c)];
+                    result[(row, c)] = row_values[c];
                 }
             }
         } else {
@@ -338,26 +363,81 @@ impl<
             let ncols = self.ncols();
             let dense_cols = dense.ncols();
 
+            // Clear result matrix once at the beginning
+            result.fill(T::zero());
+
+            // Pre-filter valid column mappings
+            let valid_cols: Vec<Option<usize>> = (0..self.matrix.ncols())
+                .map(|col| self.original_to_masked.get(col).copied().flatten())
+                .collect();
+
             let chunk_size = determine_chunk_size(nrows);
 
-            let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+            // Use atomic-free approach with proper synchronization
+            let partial_results: Vec<Vec<T>> = (0..nrows.div_ceil(chunk_size))
                 .into_par_iter()
                 .map(|chunk_idx| {
                     let start = chunk_idx * chunk_size;
                     let end = (start + chunk_size).min(nrows);
 
-                    let mut local_result = DMatrix::<T>::zeros(ncols, dense_cols);
+                    // Use flat vector for better cache performance
+                    let mut local_result = vec![T::zero(); ncols * dense_cols];
 
+                    // Process chunk with better memory access patterns
                     for i in start..end {
-                        for j in major_offsets[i]..major_offsets[i + 1] {
-                            let col = minor_indices[j];
-                            if let Some(masked_col) = self.original_to_masked[col] {
-                                let val = values[j];
+                        let dense_row = unsafe {
+                            std::slice::from_raw_parts(
+                                dense.as_ptr().add(i * dense_cols),
+                                dense_cols,
+                            )
+                        };
 
-                                for c in 0..dense_cols {
-                                    local_result[(masked_col, c)] += val * dense[(i, c)];
+                        // Block processing for better cache usage
+                        let row_start = major_offsets[i];
+                        let row_end = major_offsets[i + 1];
+
+                        // Process sparse elements in blocks of 8 for better vectorization
+                        let mut j = row_start;
+                        while j + 8 <= row_end {
+                            for offset in 0..8 {
+                                let idx = j + offset;
+                                let col = minor_indices[idx];
+                                if let Some(masked_col) = valid_cols[col] {
+                                    let val = values[idx];
+                                    let base_offset = masked_col * dense_cols;
+
+                                    // Vectorized update with manual loop unrolling
+                                    let mut c = 0;
+                                    while c + 4 <= dense_cols {
+                                        local_result[base_offset + c] += val * dense_row[c];
+                                        local_result[base_offset + c + 1] += val * dense_row[c + 1];
+                                        local_result[base_offset + c + 2] += val * dense_row[c + 2];
+                                        local_result[base_offset + c + 3] += val * dense_row[c + 3];
+                                        c += 4;
+                                    }
+
+                                    // Handle remaining columns
+                                    while c < dense_cols {
+                                        local_result[base_offset + c] += val * dense_row[c];
+                                        c += 1;
+                                    }
                                 }
                             }
+                            j += 8;
+                        }
+
+                        // Handle remaining sparse elements
+                        while j < row_end {
+                            let col = minor_indices[j];
+                            if let Some(masked_col) = valid_cols[col] {
+                                let val = values[j];
+                                let base_offset = masked_col * dense_cols;
+
+                                for c in 0..dense_cols {
+                                    local_result[base_offset + c] += val * dense_row[c];
+                                }
+                            }
+                            j += 1;
                         }
                     }
 
@@ -365,12 +445,24 @@ impl<
                 })
                 .collect();
 
+            // Efficient reduction with blocked memory access
+            const BLOCK_SIZE: usize = 32;
             for local_result in partial_results {
-                for r in 0..ncols {
-                    for c in 0..dense_cols {
-                        let val = local_result[(r, c)];
-                        if !val.is_zero() {
-                            result[(r, c)] += val;
+                // Process in blocks for better cache performance
+                for r_block in (0..ncols).step_by(BLOCK_SIZE) {
+                    let r_end = (r_block + BLOCK_SIZE).min(ncols);
+
+                    for c_block in (0..dense_cols).step_by(BLOCK_SIZE) {
+                        let c_end = (c_block + BLOCK_SIZE).min(dense_cols);
+
+                        // Update result block
+                        for r in r_block..r_end {
+                            for c in c_block..c_end {
+                                let val = local_result[r * dense_cols + c];
+                                if !val.is_zero() {
+                                    result[(r, c)] += val;
+                                }
+                            }
                         }
                     }
                 }
@@ -415,8 +507,6 @@ impl<
                         .sum()
                 })
                 .collect();
-
-            let chunk_size = std::cmp::max(16, rows / (rayon::current_num_threads() * 4));
 
             let row_updates: Vec<(usize, Vec<T>)> = (0..rows)
                 .into_par_iter()

@@ -397,15 +397,16 @@ dependencies = [
  "rand",
  "rand_distr",
  "rayon",
+ "simba",
  "single-utilities",
  "thiserror",
 ]
 
 [[package]]
 name = "single-utilities"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4f8fbd4ea3fc4e4676a2a7dc5f4e09cdd72d3f4e10c32a8dedade130adb62ab"
+checksum = "bd8b90e8aa6128de9b26903484c2cee7556cf342b190ea3570396e293d1991de"
 dependencies = [
  "num-traits",
 ]
