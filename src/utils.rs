@@ -9,7 +9,7 @@ use std::fmt::Debug;
 pub fn determine_chunk_size(nrows: usize) -> usize {
     let num_threads = rayon::current_num_threads();
 
-    let min_rows_per_thread = 16;
+    let min_rows_per_thread = 64;
     let desired_chunks_per_thread = 4;
 
     let target_total_chunks = num_threads * desired_chunks_per_thread;
@@ -25,8 +25,10 @@ pub trait SMat<T: Float> {
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
     fn compute_column_means(&self) -> Vec<T>;
     fn multiply_with_dense(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool);
-
     fn multiply_with_dense_centered(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool, means: &DVector<T>);
+
+    fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>);
+    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>);
 }
 
 /// Singular Value Decomposition Components
