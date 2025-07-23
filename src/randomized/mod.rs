@@ -1,5 +1,4 @@
 use crate::error::SvdLibError;
-use crate::utils::determine_chunk_size;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
 use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
 use ndarray::Array1;
@@ -8,7 +7,7 @@ use rand::prelude::{Distribution, StdRng};
 use rand::SeedableRng;
 use rand_distr::Normal;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator};
+use rayon::prelude::IntoParallelIterator;
 use std::ops::Mul;
 use std::time::Instant;
 
@@ -21,7 +20,6 @@ pub enum PowerIterationNormalizer {
 
 const PARALLEL_THRESHOLD_ROWS: usize = 5000;
 const PARALLEL_THRESHOLD_COLS: usize = 1000;
-const PARALLEL_THRESHOLD_ELEMENTS: usize = 100_000;
 
 pub fn randomized_svd<T, M>(
     m: &M,
@@ -326,67 +324,7 @@ fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
     sparse: &M,
     result: &mut DMatrix<T>,
 ) {
-    let q_rows = q.nrows();
-    let q_cols = q.ncols();
-    let sparse_rows = sparse.nrows();
-    let sparse_cols = sparse.ncols();
-
-    eprintln!("Q dimensions: {} x {}", q_rows, q_cols);
-    eprintln!("Sparse dimensions: {} x {}", sparse_rows, sparse_cols);
-    eprintln!("Result dimensions: {} x {}", result.nrows(), result.ncols());
-
-    assert_eq!(
-        q_rows, sparse_rows,
-        "Dimension mismatch: Q has {} rows but sparse has {} rows",
-        q_rows, sparse_rows
-    );
-
-    assert_eq!(
-        result.nrows(),
-        q_cols,
-        "Result matrix has incorrect row count: expected {}, got {}",
-        q_cols,
-        result.nrows()
-    );
-    assert_eq!(
-        result.ncols(),
-        sparse_cols,
-        "Result matrix has incorrect column count: expected {}, got {}",
-        sparse_cols,
-        result.ncols()
-    );
-
-    let chunk_size = determine_chunk_size(q_cols);
-
-    let chunk_results: Vec<Vec<(usize, Vec<T>)>> = (0..q_cols)
-        .into_par_iter()
-        .chunks(chunk_size)
-        .map(|chunk| {
-            let mut chunk_results = Vec::with_capacity(chunk.len());
-
-            for &col_idx in &chunk {
-                let mut q_col = vec![T::zero(); q_rows];
-                for i in 0..q_rows {
-                    q_col[i] = q[(i, col_idx)];
-                }
-
-                let mut result_row = vec![T::zero(); sparse_cols];
-
-                sparse.svd_opa(&q_col, &mut result_row, true);
-
-                chunk_results.push((col_idx, result_row));
-            }
-            chunk_results
-        })
-        .collect();
-
-    for chunk_result in chunk_results {
-        for (row_idx, row_values) in chunk_result {
-            for j in 0..sparse_cols {
-                result[(row_idx, j)] = row_values[j];
-            }
-        }
-    }
+    sparse.multiply_transposed_by_dense(q, result);
 }
 
 pub fn svd_flip<T: SvdFloat + 'static>(
@@ -519,79 +457,13 @@ fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker:
     result: &mut DMatrix<T>,
     column_means: &Option<DVector<T>>,
 ) {
-    // TODO optimize me please
-    if column_means.is_none() {
+     if column_means.is_none() {
         multiply_transposed_by_matrix(q, sparse, result);
         return;
     }
 
     let means = column_means.as_ref().unwrap();
-    let q_rows = q.nrows();
-    let q_cols = q.ncols();
-    let sparse_rows = sparse.nrows();
-    let sparse_cols = sparse.ncols();
-
-    assert_eq!(
-        q_rows, sparse_rows,
-        "Dimension mismatch: Q has {} rows but sparse has {} rows",
-        q_rows, sparse_rows
-    );
-
-    assert_eq!(
-        result.nrows(),
-        q_cols,
-        "Result matrix has incorrect row count: expected {}, got {}",
-        q_cols,
-        result.nrows()
-    );
-    assert_eq!(
-        result.ncols(),
-        sparse_cols,
-        "Result matrix has incorrect column count: expected {}, got {}",
-        sparse_cols,
-        result.ncols()
-    );
-
-    let chunk_size = determine_chunk_size(q_cols);
-
-    let chunk_results: Vec<Vec<(usize, Vec<T>)>> = (0..q_cols)
-        .into_par_iter()
-        .chunks(chunk_size)
-        .map(|chunk| {
-            let mut chunk_results = Vec::with_capacity(chunk.len());
-
-            for &col_idx in &chunk {
-                let mut q_col = vec![T::zero(); q_rows];
-                for i in 0..q_rows {
-                    q_col[i] = q[(i, col_idx)];
-                }
-
-                let mut result_row = vec![T::zero(); sparse_cols];
-
-                sparse.svd_opa(&q_col, &mut result_row, true);
-
-                let mut q_sum = T::zero();
-                for &val in &q_col {
-                    q_sum += val;
-                }
-
-                for j in 0..sparse_cols {
-                    result_row[j] -= means[j] * q_sum;
-                }
-
-                chunk_results.push((col_idx, result_row));
-            }
-            chunk_results
-        })
-        .collect();
-
-    for chunk_result in chunk_results {
-        for (row_idx, row_values) in chunk_result {
-            for j in 0..sparse_cols {
-                result[(row_idx, j)] = row_values[j];
-            }
-        }
-    }
+    sparse.multiply_transposed_by_dense_centered(q, result, means);
 }
 
 #[cfg(test)]

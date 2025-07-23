@@ -446,7 +446,7 @@ impl<
                 .collect();
 
             // Efficient reduction with blocked memory access
-            const BLOCK_SIZE: usize = 32;
+            const BLOCK_SIZE: usize = 64;
             for local_result in partial_results {
                 // Process in blocks for better cache performance
                 for r_block in (0..ncols).step_by(BLOCK_SIZE) {
@@ -606,6 +606,266 @@ impl<
                             for c in c_start..c_end {
                                 result[(r, c)] += local_result[(r, c)];
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
+        let q_rows = q.nrows();
+        let q_cols = q.ncols();
+        let masked_cols = self.ncols();
+
+        assert_eq!(
+            q_rows,
+            self.nrows(),
+            "Q matrix has incompatible row count: expected {}, got {}",
+            self.nrows(),
+            q_rows
+        );
+        assert_eq!(
+            result.nrows(),
+            q_cols,
+            "Result matrix has incompatible row count: expected {}, got {}",
+            q_cols,
+            result.nrows()
+        );
+        assert_eq!(
+            result.ncols(),
+            masked_cols,
+            "Result matrix has incompatible column count: expected {}, got {}",
+            masked_cols,
+            result.ncols()
+        );
+
+        // Clear result matrix
+        for i in 0..result.nrows() {
+            for j in 0..result.ncols() {
+                result[(i, j)] = T::zero();
+            }
+        }
+
+        let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+        let nrows = self.matrix.nrows();
+        let chunk_size = determine_chunk_size(nrows);
+
+        if self.uses_all_columns() && (nrows < 1000 && self.matrix.ncols() < 1000) {
+            // Fast path for small unmasked matrices
+            let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(nrows);
+                    let mut local_result = DMatrix::<T>::zeros(q_cols, masked_cols);
+
+                    for row in start..end {
+                        // Process all non-zeros in this row
+                        for idx in major_offsets[row]..major_offsets[row + 1] {
+                            let col = minor_indices[idx];
+                            let sparse_val = values[idx];
+
+                            // Accumulate: local_result[q_col, col] += q[row, q_col] * sparse_val
+                            for q_col in 0..q_cols {
+                                local_result[(q_col, col)] += q[(row, q_col)] * sparse_val;
+                            }
+                        }
+                    }
+
+                    local_result
+                })
+                .collect();
+
+            // Combine partial results efficiently
+            for local_result in partial_results {
+                for r in 0..q_cols {
+                    for c in 0..masked_cols {
+                        let val = local_result[(r, c)];
+                        if !val.is_zero() {
+                            result[(r, c)] += val;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Optimized path for masked matrices
+            let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(nrows);
+                    let mut local_result = DMatrix::<T>::zeros(q_cols, masked_cols);
+
+                    for row in start..end {
+                        // Process all non-zeros in this row
+                        for idx in major_offsets[row]..major_offsets[row + 1] {
+                            let original_col = minor_indices[idx];
+                            
+                            // Check if this column is in our mask
+                            if let Some(masked_col) = self.original_to_masked[original_col] {
+                                let sparse_val = values[idx];
+
+                                // Accumulate: local_result[q_col, masked_col] += q[row, q_col] * sparse_val
+                                for q_col in 0..q_cols {
+                                    local_result[(q_col, masked_col)] += q[(row, q_col)] * sparse_val;
+                                }
+                            }
+                        }
+                    }
+
+                    local_result
+                })
+                .collect();
+
+            // Combine partial results efficiently
+            for local_result in partial_results {
+                for r in 0..q_cols {
+                    for c in 0..masked_cols {
+                        let val = local_result[(r, c)];
+                        if !val.is_zero() {
+                            result[(r, c)] += val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn multiply_transposed_by_dense_centered(
+        &self,
+        q: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        means: &DVector<T>,
+    ) {
+        let q_rows = q.nrows();
+        let q_cols = q.ncols();
+        let masked_cols = self.ncols();
+
+        assert_eq!(
+            q_rows,
+            self.nrows(),
+            "Q matrix has incompatible row count: expected {}, got {}",
+            self.nrows(),
+            q_rows
+        );
+        assert_eq!(
+            result.nrows(),
+            q_cols,
+            "Result matrix has incompatible row count: expected {}, got {}",
+            q_cols,
+            result.nrows()
+        );
+        assert_eq!(
+            result.ncols(),
+            masked_cols,
+            "Result matrix has incompatible column count: expected {}, got {}",
+            masked_cols,
+            result.ncols()
+        );
+        assert_eq!(
+            means.len(),
+            masked_cols,
+            "Means vector has incompatible length: expected {}, got {}",
+            masked_cols,
+            means.len()
+        );
+
+        // Clear result matrix
+        for i in 0..result.nrows() {
+            for j in 0..result.ncols() {
+                result[(i, j)] = T::zero();
+            }
+        }
+
+        let (major_offsets, minor_indices, values) = self.matrix.csr_data();
+
+        // Pre-compute column sums of Q - following the pattern from multiply_with_dense_centered
+        let q_col_sums: Vec<T> = (0..q_cols)
+            .into_par_iter()
+            .map(|col| {
+                (0..q_rows).map(|row| q[(row, col)]).sum()
+            })
+            .collect();
+
+        // Pre-compute mean adjustments for each masked column
+        // For Q^T * (A - means): result[q_col, masked_col] = Q^T * A - sum(Q[q_col]) * means[masked_col]
+        let mean_adjustments: Vec<T> = q_col_sums
+            .iter()
+            .enumerate()
+            .map(|(q_col, &q_sum)| {
+                means
+                    .iter()
+                    .enumerate()
+                    .map(|(masked_col_idx, &mean_val)| {
+                        if masked_col_idx < masked_cols {
+                            q_sum * mean_val
+                        } else {
+                            T::zero()
+                        }
+                    })
+                    .sum()
+            })
+            .collect();
+
+        let nrows = self.matrix.nrows();
+        let chunk_size = determine_chunk_size(nrows);
+
+        // Process sparse matrix rows in chunks, similar to the transpose_self=true case
+        let partial_results: Vec<DMatrix<T>> = (0..nrows.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = std::cmp::min(start + chunk_size, nrows);
+
+                let mut local_result = DMatrix::<T>::zeros(q_cols, masked_cols);
+
+                for row in start..end {
+                    // Process all non-zeros in this row
+                    for idx in major_offsets[row]..major_offsets[row + 1] {
+                        let original_col = minor_indices[idx];
+                        
+                        // Check if this column is in our mask
+                        if let Some(masked_col) = self.original_to_masked[original_col] {
+                            let sparse_val = values[idx];
+
+                            // Accumulate: local_result[q_col, masked_col] += q[row, q_col] * sparse_val
+                            for q_col in 0..q_cols {
+                                local_result[(q_col, masked_col)] += q[(row, q_col)] * sparse_val;
+                            }
+                        }
+                    }
+                }
+
+                // Apply mean adjustment for this chunk, following the pattern from your function
+                let chunk_fraction = T::from_f64((end - start) as f64 / q_rows as f64).unwrap();
+
+                for q_col in 0..q_cols {
+                    let q_sum = q_col_sums[q_col];
+                    for masked_col in 0..masked_cols {
+                        local_result[(q_col, masked_col)] -= q_sum * means[masked_col] * chunk_fraction;
+                    }
+                }
+
+                local_result
+            })
+            .collect();
+
+        // Combine partial results with block-wise writing for better cache locality
+        for local_result in partial_results {
+            const BLOCK_SIZE: usize = 64;
+
+            for r_block in 0..q_cols.div_ceil(BLOCK_SIZE) {
+                let r_start = r_block * BLOCK_SIZE;
+                let r_end = std::cmp::min(r_start + BLOCK_SIZE, q_cols);
+
+                for c_block in 0..masked_cols.div_ceil(BLOCK_SIZE) {
+                    let c_start = c_block * BLOCK_SIZE;
+                    let c_end = std::cmp::min(c_start + BLOCK_SIZE, masked_cols);
+
+                    for r in r_start..r_end {
+                        for c in c_start..c_end {
+                            result[(r, c)] += local_result[(r, c)];
                         }
                     }
                 }

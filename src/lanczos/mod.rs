@@ -1493,6 +1493,14 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
     ) {
         todo!()
     }
+    
+    fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
+        todo!()
+    }
+    
+    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
+        todo!()
+    }
 }
 
 impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SMat<T>
@@ -1636,6 +1644,14 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
     ) {
         todo!()
     }
+    
+    fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
+        todo!()
+    }
+    
+    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
+        todo!()
+    }
 }
 
 impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
@@ -1711,6 +1727,14 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
         transpose_self: bool,
         means: &DVector<T>,
     ) {
+        todo!()
+    }
+    
+    fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
+        todo!()
+    }
+    
+    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
         todo!()
     }
 }

@@ -4,7 +4,7 @@ description = "A Rust port of LAS2 from SVDLIBC"
 keywords = ["svd"]
 categories = ["algorithms", "data-structures", "mathematics", "science"]
 name = "single-svdlib"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license-file = "SVDLIBC-LICENSE.txt"
 
