@@ -96,6 +96,8 @@ where
                 PowerIterationNormalizer::QR => {
                     let qr = z.qr();
                     z = qr.q();
+                    // After QR normalization, z has fewer columns, so we need to resize y
+                    y = DMatrix::<T>::zeros(m_rows, z.ncols());
                 }
                 PowerIterationNormalizer::LU => {
                     normalize_columns(&mut z);
