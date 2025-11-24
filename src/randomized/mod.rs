@@ -1,5 +1,5 @@
 use crate::error::SvdLibError;
-use crate::{Diagnostics, IntoNdarray2, SMat, SvdFloat, SvdRec};
+use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
 use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
 use ndarray::Array1;
 use rand::prelude::{Distribution, StdRng};
@@ -9,6 +9,7 @@ use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
 use std::ops::Mul;
 use std::time::Instant;
+use single_utilities::traits::IntoNdarray2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PowerIterationNormalizer {

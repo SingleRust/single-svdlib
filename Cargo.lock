@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "single-svdlib"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "nalgebra",
@@ -486,11 +486,13 @@ dependencies = [
 
 [[package]]
 name = "single-utilities"
-version = "0.8.7"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfb3b4e51b9b3ad56cdb99c7dc626d00c388a13287eedd5e35c2483dd59c4b31"
+checksum = "8da70cfdee29ff4e96dbbcf5268ba3cdbf0a3002d84826d10d2f5cd211595f87"
 dependencies = [
  "anyhow",
+ "nalgebra",
+ "ndarray",
  "num-traits",
 ]
 

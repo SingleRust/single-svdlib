@@ -111,22 +111,3 @@ impl SvdFloat for f64 {
         (b - a).abs() < f64::EPSILON
     }
 }
-
-pub trait IntoNdarray2 {
-    type Out;
-
-    fn into_ndarray2(self) -> Self::Out;
-}
-
-impl<N: Scalar> IntoNdarray2 for nalgebra::Matrix<N, Dyn, Dyn, nalgebra::VecStorage<N, Dyn, Dyn>>
-where
-    nalgebra::DefaultAllocator:
-    nalgebra::allocator::Allocator<Dyn, Dyn, Buffer<N> = nalgebra::VecStorage<N, Dyn, Dyn>>,
-{
-    type Out = ndarray::Array2<N>;
-
-    fn into_ndarray2(self) -> Self::Out {
-        ndarray::Array2::from_shape_vec(self.shape().strides(self.strides()), self.data.into())
-            .unwrap()
-    }
-}
