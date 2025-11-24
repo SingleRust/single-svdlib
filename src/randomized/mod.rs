@@ -1,8 +1,7 @@
 use crate::error::SvdLibError;
-use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
+use crate::{Diagnostics, IntoNdarray2, SMat, SvdFloat, SvdRec};
 use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
 use ndarray::Array1;
-use nshare::IntoNdarray2;
 use rand::prelude::{Distribution, StdRng};
 use rand::SeedableRng;
 use rand_distr::Normal;

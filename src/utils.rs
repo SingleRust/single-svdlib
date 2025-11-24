@@ -1,10 +1,11 @@
 use rayon::iter::ParallelIterator;
 use nalgebra_sparse::na::{DMatrix, DVector};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ShapeBuilder};
 use num_traits::{Float, Zero};
 use rayon::prelude::{IntoParallelIterator, IndexedParallelIterator};
 use single_utilities::traits::FloatOpsTS;
 use std::fmt::Debug;
+use nalgebra::{Dim, Dyn, Scalar};
 
 pub fn determine_chunk_size(nrows: usize) -> usize {
     let num_threads = rayon::current_num_threads();
@@ -108,5 +109,24 @@ impl SvdFloat for f64 {
 
     fn compare(a: Self, b: Self) -> bool {
         (b - a).abs() < f64::EPSILON
+    }
+}
+
+pub trait IntoNdarray2 {
+    type Out;
+
+    fn into_ndarray2(self) -> Self::Out;
+}
+
+impl<N: Scalar> IntoNdarray2 for nalgebra::Matrix<N, Dyn, Dyn, nalgebra::VecStorage<N, Dyn, Dyn>>
+where
+    nalgebra::DefaultAllocator:
+    nalgebra::allocator::Allocator<Dyn, Dyn, Buffer<N> = nalgebra::VecStorage<N, Dyn, Dyn>>,
+{
+    type Out = ndarray::Array2<N>;
+
+    fn into_ndarray2(self) -> Self::Out {
+        ndarray::Array2::from_shape_vec(self.shape().strides(self.strides()), self.data.into())
+            .unwrap()
     }
 }
