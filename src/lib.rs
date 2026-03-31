@@ -1,4 +1,3 @@
-pub mod legacy;
 pub mod error;
 pub(crate) mod utils;
 pub mod sprs_impl;
@@ -13,7 +12,6 @@ pub use utils::*;
 #[cfg(test)]
 mod simple_comparison_tests {
     use super::*;
-    use legacy;
     use nalgebra_sparse::coo::CooMatrix;
     use nalgebra_sparse::CsrMatrix;
     use rand::{Rng, SeedableRng};
@@ -61,54 +59,6 @@ mod simple_comparison_tests {
 
         coo
     }
-    //#[test]
-    fn simple_matrix_comparison() {
-        // Create a small, predefined test matrix
-        let mut test_matrix = CooMatrix::<f64>::new(3, 3);
-        test_matrix.push(0, 0, 1.0);
-        test_matrix.push(0, 1, 16.0);
-        test_matrix.push(0, 2, 49.0);
-        test_matrix.push(1, 0, 4.0);
-        test_matrix.push(1, 1, 25.0);
-        test_matrix.push(1, 2, 64.0);
-        test_matrix.push(2, 0, 9.0);
-        test_matrix.push(2, 1, 36.0);
-        test_matrix.push(2, 2, 81.0);
-
-        // Run both implementations with the same seed for deterministic behavior
-        let seed = 42;
-        let current_result = lanczos::svd_dim_seed(&test_matrix, 0, seed).unwrap();
-        let legacy_result = legacy::svd_dim_seed(&test_matrix, 0, seed).unwrap();
-
-        // Compare dimensions
-        assert_eq!(current_result.d, legacy_result.d);
-
-        // Compare singular values
-        let epsilon = 1.0e-12;
-        for i in 0..current_result.d {
-            let diff = (current_result.s[i] - legacy_result.s[i]).abs();
-            assert!(
-                diff < epsilon,
-                "Singular value {} differs by {}: current = {}, legacy = {}",
-                i, diff, current_result.s[i], legacy_result.s[i]
-            );
-        }
-
-        // Compare reconstructed matrices
-        let current_reconstructed = current_result.recompose();
-        let legacy_reconstructed = legacy_result.recompose();
-
-        for i in 0..3 {
-            for j in 0..3 {
-                let diff = (current_reconstructed[[i, j]] - legacy_reconstructed[[i, j]]).abs();
-                assert!(
-                    diff < epsilon,
-                    "Reconstructed matrix element [{},{}] differs by {}: current = {}, legacy = {}",
-                    i, j, diff, current_reconstructed[[i, j]], legacy_reconstructed[[i, j]]
-                );
-            }
-        }
-    }
 
     #[test]
     fn random_matrix_comparison() {
@@ -128,8 +78,8 @@ mod simple_comparison_tests {
 
         let csr = CsrMatrix::from(&coo);
 
-        // Calculate SVD using original method
-        let legacy_svd = lanczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
+        // Calculate SVD using normal method
+        let normal_svd = lanczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
 
         // Calculate SVD using our masked method (using all columns)
         let mask = vec![true; ncols];
@@ -139,18 +89,18 @@ mod simple_comparison_tests {
         // Compare with relative tolerance
         let rel_tol = 1e-3;  // 0.1% relative tolerance
 
-        assert_eq!(legacy_svd.d, current_svd.d, "Ranks differ");
+        assert_eq!(normal_svd.d, current_svd.d, "Ranks differ");
 
-        for i in 0..legacy_svd.d {
-            let legacy_val = legacy_svd.s[i];
+        for i in 0..normal_svd.d {
+            let normal_val = normal_svd.s[i];
             let current_val = current_svd.s[i];
-            let abs_diff = (legacy_val - current_val).abs();
-            let rel_diff = abs_diff / legacy_val.max(current_val);
+            let abs_diff = (normal_val - current_val).abs();
+            let rel_diff = abs_diff / normal_val.max(current_val);
 
             assert!(
                 rel_diff <= rel_tol,
-                "Singular value {} differs too much: relative diff = {}, current = {}, legacy = {}",
-                i, rel_diff, current_val, legacy_val
+                "Singular value {} differs too much: relative diff = {}, current = {}, normal = {}",
+                i, rel_diff, current_val, normal_val
             );
         }
     }
