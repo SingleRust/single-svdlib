@@ -169,7 +169,7 @@ where
     Ok(SvdRec {
         // Dimensionality (number of Ut,Vt rows & length of S)
         d: r.d,
-        u: Array2::from_shape_vec((r.d, r.Ut.cols), r.Ut.value)?,
+        u: Array2::from_shape_vec((r.d, r.Ut.cols), r.Ut.value)?.reversed_axes(),
         s: Array::from_shape_vec(r.d, r.S)?,
         vt: Array2::from_shape_vec((r.d, r.Vt.cols), r.Vt.value)?,
         diagnostics: Diagnostics {
@@ -1298,6 +1298,7 @@ fn lanso<T: SvdFloat>(
             l = i + 1;
         }
 
+        svd_dcopy(j + 1, 0, &wrk.alf, &mut wrk.ritz);
         // sort eigenvalues into increasing order
         insert_sort(j + 1, &mut wrk.ritz, &mut wrk.bnd);
 

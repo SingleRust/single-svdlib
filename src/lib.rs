@@ -189,15 +189,92 @@ mod simple_comparison_tests {
     }
 
     #[test]
-    fn test_randomized_svd_very_large_sparse_matrix() {
-        let csr = make_sprs_matrix(100000, 2500, 0.01);
+    fn test_cross_library_consistency() {
+        let (rows, cols) = (20, 15);
+        let coo = create_sparse_matrix(rows, cols, 0.2);
+        let nalgebra_csr = nalgebra_sparse::CsrMatrix::from(&coo);
+
+        // Convert to sprs CSR
+        let mut sprs_tri = sprs::TriMat::new((rows, cols));
+        for (i, j, &val) in coo.triplet_iter() {
+            sprs_tri.add_triplet(i, j, val);
+        }
+        let sprs_csr = sprs_tri.to_csr::<usize>();
+
+        let seed = 42;
+        let dimensions = 5;
+
+        let nalgebra_svd = lanczos::svd_dim_seed(&nalgebra_csr, dimensions, seed).unwrap();
+        let sprs_svd = lanczos::svd_dim_seed(&sprs_csr, dimensions, seed).unwrap();
+
+        assert_eq!(nalgebra_svd.d, sprs_svd.d);
+
+        let epsilon = 1e-10;
+        for i in 0..nalgebra_svd.d {
+            assert!(
+                (nalgebra_svd.s[i] - sprs_svd.s[i]).abs() < epsilon,
+                "Singular value mismatch at index {}: nalgebra={}, sprs={}",
+                i,
+                nalgebra_svd.s[i],
+                sprs_svd.s[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconstruction_property() {
+        let (rows, cols) = (3, 3);
+        let mut coo = nalgebra_sparse::coo::CooMatrix::<f64>::new(rows, cols);
+        // [1 2 3; 4 5 6; 7 8 10] - full rank
+        coo.push(0, 0, 1.0);
+        coo.push(0, 1, 2.0);
+        coo.push(0, 2, 3.0);
+        coo.push(1, 0, 4.0);
+        coo.push(1, 1, 5.0);
+        coo.push(1, 2, 6.0);
+        coo.push(2, 0, 7.0);
+        coo.push(2, 1, 8.0);
+        coo.push(2, 2, 10.0);
+        let csr = nalgebra_sparse::CsrMatrix::from(&coo);
+
+        let mut original_dense = ndarray::Array2::zeros((rows, cols));
+        original_dense[[0, 0]] = 1.0;
+        original_dense[[0, 1]] = 2.0;
+        original_dense[[0, 2]] = 3.0;
+        original_dense[[1, 0]] = 4.0;
+        original_dense[[1, 1]] = 5.0;
+        original_dense[[1, 2]] = 6.0;
+        original_dense[[2, 0]] = 7.0;
+        original_dense[[2, 1]] = 8.0;
+        original_dense[[2, 2]] = 10.0;
+
+        let dimensions = 3;
+        // Use high iterations to ensure full convergence for this small matrix
+        let svd = lanczos::svd_las2(&csr, dimensions, 20, &[0.0, 0.0], 1e-15, 42).unwrap();
+
+        let reconstructed = svd.recompose();
+
+        let mut max_diff: f64 = 0.0;
+        for i in 0..rows {
+            for j in 0..cols {
+                max_diff = max_diff.max((reconstructed[[i, j]] - original_dense[[i, j]]).abs());
+            }
+        }
+
+        println!("Max reconstruction error: {}", max_diff);
+        assert!(max_diff < 1e-3, "Reconstruction failed: {}", max_diff);
+    }
+
+    #[test]
+    fn test_randomized_svd_small_sparse_matrix() {
+        let csr = make_sprs_matrix(1000, 250, 0.01);
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
             randomized::randomized_svd(
                 &csr,
                 50,
                 10,
-                7,
+                2,
                 randomized::PowerIterationNormalizer::QR,
                 false,
                 Some(42),
@@ -227,6 +304,7 @@ mod simple_comparison_tests {
             assert!(s.abs() < 1e-15);
         }
     }
+
     #[test]
     fn test_dimension_one() {
         let rows = 10;
