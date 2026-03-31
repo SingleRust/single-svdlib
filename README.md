@@ -9,19 +9,21 @@ A high-performance Rust library for computing Singular Value Decomposition (SVD)
 ## Features
 
 - **Multiple SVD algorithms**:
-    - Lanczos algorithm (based on SVDLIBC)
+    - Lanczos algorithm (LAS2 port of SVDLIBC)
     - Randomized SVD for very large and sparse matrices
 - **Sparse matrix support**:
-    - Compressed Sparse Row (CSR) format
-    - Compressed Sparse Column (CSC) format
-    - Coordinate (COO) format
-- **Performance optimizations**:
-    - Parallel execution with Rayon
-    - Adaptive tuning for highly sparse matrices
-    - Column masking for subspace SVD
+    - Native support for `nalgebra-sparse` (`CsrMatrix`, `CscMatrix`, `CooMatrix`)
+    - Native support for `sprs` (`CsMatI`)
+- **Memory & Performance optimizations**:
+    - Parallel execution with Rayon across all sparse multiplication paths
+    - Memory-efficient Lanczos subspace streaming (eliminates double-buffering)
+    - Cache-optimized bidiagonal solver
+    - Column masking for subspace SVD without data copying
 - **Generic interface**:
     - Works with both `f32` and `f64` precision
-- **Comprehensive error handling and diagnostics**
+- **Algebraic Consistency**:
+    - Standardized output orientation across all algorithms: $A \approx U S V^T$
+    - Built-in reconstruction via `svd.recompose()`
 
 ## Installation
 
@@ -29,14 +31,14 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-single-svdlib = "0.6.0"
+single-svdlib = "2.0.0"
 ```
 
 ## Quick Start
 
 ```rust
 use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
-use single_svdlib::laczos::svd_dim_seed;
+use single_svdlib::lanczos::svd_dim_seed;
 
 // Create a matrix in COO format
 let mut coo = CooMatrix::<f64>::new(3, 3);
@@ -51,11 +53,11 @@ let csr = CsrMatrix::from(&coo);
 let svd = svd_dim_seed(&csr, 3, 42).unwrap();
 
 // Access the results
-let singular_values = &svd.s;
-let left_singular_vectors = &svd.ut;  // Note: These are transposed
-let right_singular_vectors = &svd.vt; // Note: These are transposed
+let singular_values = &svd.s;      // Descending order [d]
+let u = &svd.u;                    // Left singular vectors [M x d] (vectors as columns)
+let vt = &svd.vt;                  // Transpose of right singular vectors [d x N] (vectors as rows)
 
-// Reconstruct the original matrix
+// Reconstruct the original matrix: A ≈ U * S * VT
 let reconstructed = svd.recompose();
 ```
 
@@ -66,26 +68,16 @@ let reconstructed = svd.recompose();
 The Lanczos algorithm is well-suited for sparse matrices of moderate size:
 
 ```rust
-use single_svdlib::laczos;
+use single_svdlib::lanczos;
 
 // Basic SVD computation (uses defaults)
-let svd = laczos::svd(&matrix)?;
+let svd = lanczos::svd(&matrix)?;
 
 // SVD with specified target rank
-let svd = laczos::svd_dim(&matrix, 10)?;
+let svd = lanczos::svd_dim(&matrix, 10)?;
 
 // SVD with specified target rank and fixed random seed
-let svd = laczos::svd_dim_seed(&matrix, 10, 42)?;
-
-// Full control over SVD parameters
-let svd = laczos::svd_las2(
-    &matrix,
-    dimensions,    // upper limit of desired number of dimensions
-    iterations,    // number of Lanczos iterations
-    end_interval,  // interval containing unwanted eigenvalues, e.g. [-1e-30, 1e-30]
-    kappa,         // relative accuracy of eigenvalues, e.g. 1e-6
-    random_seed,   // random seed (0 for automatic)
-)?;
+let svd = lanczos::svd_dim_seed(&matrix, 10, 42)?;
 ```
 
 ### Randomized SVD
@@ -102,67 +94,33 @@ let svd = randomized::randomized_svd(
     n_power_iterations,                  // number of power iterations (typically 2-4)
     randomized::PowerIterationNormalizer::QR,  // normalization method
     Some(42),                           // random seed (None for automatic)
+    false,                              // mean centering
 )?;
-```
-
-### Column Masking
-
-For operations on specific columns of a matrix:
-
-```rust
-use single_svdlib::laczos::masked::MaskedCSRMatrix;
-
-// Create a mask for selected columns
-let columns = vec![0, 2, 5, 7];  // Only use these columns
-let masked_matrix = MaskedCSRMatrix::with_columns(&csr_matrix, &columns);
-
-// Compute SVD on the masked matrix
-let svd = laczos::svd(&masked_matrix)?;
 ```
 
 ## Result Structure
 
-The SVD result contains:
+The SVD result `SvdRec<T>` is designed for maximum interoperability:
 
 ```rust
 struct SvdRec<T> {
-    d: usize,              // Rank (number of singular values)
-    ut: Array2<T>,         // Transpose of left singular vectors (d x m)
-    s: Array1<T>,          // Singular values (d)
-    vt: Array2<T>,         // Transpose of right singular vectors (d x n)
-    diagnostics: Diagnostics<T>,  // Computation diagnostics
+    d: usize,              // Rank (number of singular values found)
+    u: Array2<T>,          // Left singular vectors (M x d)
+    s: Array1<T>,          // Singular values (d), sorted descending
+    vt: Array2<T>,         // Right singular vectors (d x N)
+    diagnostics: Diagnostics<T>,
 }
 ```
 
-Note that `ut` and `vt` are returned in transposed form.
-
-## Diagnostics
-
-Each SVD computation returns detailed diagnostics:
-
-```rust
-let svd = laczos::svd(&matrix)?;
-println!("Non-zero elements: {}", svd.diagnostics.non_zero);
-println!("Transposed during computation: {}", svd.diagnostics.transposed);
-println!("Lanczos steps: {}", svd.diagnostics.lanczos_steps);
-println!("Significant values found: {}", svd.diagnostics.significant_values);
-```
+The orientations match standard linear algebra conventions ($A = U S V^T$):
+- `u` stores singular vectors as **columns**.
+- `vt` stores singular vectors as **rows**.
 
 ## Performance Tips
 
-1. **Choose the right algorithm**:
-    - For matrices up to ~10,000 x 10,000 with moderate sparsity, use the Lanczos algorithm
-    - For larger matrices or very high sparsity (>99%), use randomized SVD
-
-2. **Matrix format matters**:
-    - Convert COO matrices to CSR or CSC for computation
-    - CSR typically performs better for row-oriented operations
-
-3. **Adjust parameters for very sparse matrices**:
-    - Increase power iterations in randomized SVD (e.g., 5-7)
-    - Use a higher `kappa` value in Lanczos for very sparse matrices
-
-4. **Consider column masking** for operations that only need a subset of the data
+1. **Leverage Rayon**: The library automatically detects and uses the available Rayon thread pool for sparse matrix multiplications and singular vector combinations.
+2. **Matrix Format**: Use `CsrMatrix` for row-major heavy operations. Both `nalgebra-sparse` and `sprs` are natively supported via the `SMat` trait.
+3. **Memory Efficiency**: The Lanczos implementation has been optimized to stream vectors directly from storage, avoiding the $O(d \times N)$ memory spikes seen in standard ports.
 
 ## License
 
@@ -172,4 +130,4 @@ This crate is licensed under the BSD License, the same as the original SVDLIBC i
 
 - Original SVDLIBC implementation by Doug Rohde
 - Rust port maintainer of SVDLIBC: Dave Farnham
-- Extensions and modifications of the original algorithm: Ian F. Diks
+- Performance optimizations and algebraic fixes: Ian F. Diks
