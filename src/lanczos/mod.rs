@@ -1,4 +1,5 @@
 pub mod masked;
+pub mod masked_sprs;
 
 use crate::error::SvdLibError;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};

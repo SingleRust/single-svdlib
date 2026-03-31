@@ -483,12 +483,9 @@ mod randomized_svd_tests {
 
     fn setup_thread_pool() {
         INIT.call_once(|| {
-            ThreadPoolBuilder::new()
-                .num_threads(16)
-                .build_global()
-                .expect("Failed to build global thread pool");
-
-            println!("Initialized thread pool with {} threads", 16);
+            // Ignore error — the global pool may have already been initialized
+            // (e.g., by another test that triggered Rayon's lazy init first).
+            let _ = ThreadPoolBuilder::new().num_threads(16).build_global();
         });
     }
 
