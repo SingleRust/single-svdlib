@@ -130,8 +130,8 @@ impl<
 
         let (major_offsets, minor_indices, values) = self.matrix.csr_data();
 
-        if self.uses_all_columns() || (self.matrix.nrows() < 1000 && self.matrix.ncols() < 1000) {
-            // Fast path for unmasked matrices or small matrices
+        if self.uses_all_columns() {
+            // Fast path for unmasked matrices
             if !transposed {
                 // A * x calculation
                 self.matrix.svd_opa(x, y, false);
@@ -967,9 +967,9 @@ mod tests {
         assert_eq!(masked_matrix.ncols(), physical_csr.ncols());
         assert_eq!(masked_matrix.nnz(), physical_csr.nnz());
 
-        // Perform SVD on both
-        let svd_masked = crate::lanczos::svd(&masked_matrix).unwrap();
-        let svd_physical = crate::lanczos::svd(&physical_csr).unwrap();
+        // Perform SVD on both with the same seed for deterministic comparison
+        let svd_masked = crate::lanczos::svd_dim_seed(&masked_matrix, 0, 42).unwrap();
+        let svd_physical = crate::lanczos::svd_dim_seed(&physical_csr, 0, 42).unwrap();
 
         // Compare SVD results - they should be very close but not exactly the same
         // due to potential differences in numerical computation
