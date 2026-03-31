@@ -5,8 +5,7 @@ use crate::error::SvdLibError;
 use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
 use nalgebra_sparse::na::{DMatrix, DVector};
 use ndarray::{Array, Array2};
-use num_traits::real::Real;
-use num_traits::{Float, FromPrimitive, One, Zero};
+use num_traits::{Float, FromPrimitive, Zero};
 use rand::rngs::StdRng;
 use rand::{rng, Rng, RngCore, SeedableRng};
 use rayon::iter::IndexedParallelIterator;
@@ -15,7 +14,7 @@ use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, IntoParallel
 use std::fmt::Debug;
 use std::iter::Sum;
 use std::mem;
-use std::ops::{AddAssign, MulAssign, Neg, SubAssign};
+use std::ops::{AddAssign, MulAssign, SubAssign};
 
 /// Trait for floating point types that can be used with the SVD algorithm
 
@@ -132,13 +131,13 @@ where
         _ => iterations,
     };
 
-    if dimensions < 2 {
+    if dimensions < 1 {
         return Err(SvdLibError::Las2Error(format!(
             "svd_las2: insufficient dimensions: {dimensions}"
         )));
     }
 
-    assert!(dimensions > 1 && dimensions <= min_nrows_ncols);
+    assert!(dimensions >= 1 && dimensions <= min_nrows_ncols);
     assert!(iterations >= dimensions && iterations <= min_nrows_ncols);
 
     let transposed = (a.ncols() as f64) >= ((a.nrows() as f64) * 1.2);
@@ -371,7 +370,7 @@ fn svd_pythag<T: SvdFloat + FromPrimitive>(a: T, b: T) -> T {
                 let s = r / t;
                 let u = T::one() + two * s;
                 p = p * u;
-                r = Float::powi((s / u), 2);
+                r = Float::powi(s / u, 2);
                 t = four + r;
             }
             p
@@ -438,7 +437,7 @@ fn imtqlb<T: SvdFloat>(
         return Ok(());
     }
 
-    let matrix_size_factor = T::from_f64((n as f64).sqrt()).unwrap();
+    let _matrix_size_factor = T::from_f64((n as f64).sqrt()).unwrap();
 
     bnd[0] = T::one();
     let last = n - 1;
@@ -464,13 +463,8 @@ fn imtqlb<T: SvdFloat>(
                     break;
                 }
 
-                // More forgiving convergence test for large/sparse matrices
                 let test = Float::abs(d[m]) + Float::abs(d[m + 1]);
-                // Scale tolerance with matrix size and magnitude
-                let tol = <T as Float>::epsilon()
-                    * T::from_f64(100.0).unwrap()
-                    * Float::max(test, T::one())
-                    * matrix_size_factor;
+                let tol = <T as Float>::epsilon() * Float::max(test, T::one());
 
                 if Float::abs(e[m]) <= tol {
                     break; // Convergence achieved for this element
@@ -617,9 +611,7 @@ fn startv<T: SvdFloat>(
     }
 
     if rnm2 <= T::zero() {
-        return Err(SvdLibError::StartvError(format!(
-            "rnm2 <= 0.0, rnm2 = {rnm2:?}"
-        )));
+        return Ok(T::zero());
     }
 
     if step > 0 {
@@ -650,7 +642,7 @@ fn stpone<T: SvdFloat>(
     // get initial vector; default is random
     let mut rnm = startv(A, wrk, 0, store, random_seed)?;
     if compare(rnm, T::zero()) {
-        return Err(SvdLibError::StponeError("rnm == 0.0".to_string()));
+        return Ok((T::zero(), T::eps()));
     }
 
     // normalize starting vector
@@ -773,7 +765,7 @@ fn purge<T: SvdFloat>(
 
     let reps = T::eps().sqrt();
     let eps1 = T::eps() * T::from_f64(n as f64).unwrap().sqrt();
-    let two = T::from_f64(2.0).unwrap();
+    let _two = T::from_f64(2.0).unwrap();
 
     let k = svd_idamax(step - (ll + 1), &wrk.eta) + ll;
     if Float::abs(wrk.eta[k]) > reps {
@@ -847,52 +839,62 @@ fn error_bound<T: SvdFloat>(
     step: usize,
     tol: T,
 ) -> usize {
-    assert!(step > 0, "error_bound: expected 'step' to be non-zero");
-
     // massage error bounds for very close ritz values
-    let mid = svd_idamax(step + 1, bnd);
-    let sixteen = T::from_f64(16.0).unwrap();
+    if step > 0 {
+        let mid = svd_idamax(step + 1, bnd);
+        let _sixteen = T::from_f64(16.0).unwrap();
 
-    let mut i = ((step + 1) + (step - 1)) / 2;
-    while i > mid + 1 {
-        if Float::abs(ritz[i - 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
-            && bnd[i] > tol
-            && bnd[i - 1] > tol
-        {
-            bnd[i - 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i - 1], 2)).sqrt();
-            bnd[i] = T::zero();
+        let mut i = ((step + 1) + (step - 1)) / 2;
+        while i > mid + 1 {
+            if Float::abs(ritz[i - 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
+                && bnd[i] > tol
+                && bnd[i - 1] > tol
+            {
+                bnd[i - 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i - 1], 2)).sqrt();
+                bnd[i] = T::zero();
+            }
+            i -= 1;
         }
-        i -= 1;
-    }
 
-    let mut i = ((step + 1) - (step - 1)) / 2;
-    while i + 1 < mid {
-        if Float::abs(ritz[i + 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
-            && bnd[i] > tol
-            && bnd[i + 1] > tol
-        {
-            bnd[i + 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i + 1], 2)).sqrt();
-            bnd[i] = T::zero();
+        let mut i = ((step + 1) - (step - 1)) / 2;
+        while i + 1 < mid {
+            if Float::abs(ritz[i + 1] - ritz[i]) < T::eps34() * Float::abs(ritz[i])
+                && bnd[i] > tol
+                && bnd[i + 1] > tol
+            {
+                bnd[i + 1] = (Float::powi(bnd[i], 2) + Float::powi(bnd[i + 1], 2)).sqrt();
+                bnd[i] = T::zero();
+            }
+            i += 1;
         }
-        i += 1;
     }
 
     // refine the error bounds
     let mut neig = 0;
-    let mut gapl = ritz[step] - ritz[0];
-    for i in 0..=step {
-        let mut gap = gapl;
-        if i < step {
-            gapl = ritz[i + 1] - ritz[i];
+    let sixteen = T::from_f64(16.0).unwrap();
+    if step > 0 {
+        let mut gapl = ritz[step] - ritz[0];
+        for i in 0..=step {
+            let mut gap = gapl;
+            if i < step {
+                gapl = ritz[i + 1] - ritz[i];
+            }
+            gap = Float::min(gap, gapl);
+            if gap > bnd[i] {
+                bnd[i] *= bnd[i] / gap;
+            }
+            if bnd[i] <= sixteen * T::eps() * Float::abs(ritz[i]) {
+                neig += 1;
+                if !*enough {
+                    *enough = endl < ritz[i] && ritz[i] < endr;
+                }
+            }
         }
-        gap = Float::min(gap, gapl);
-        if gap > bnd[i] {
-            bnd[i] *= bnd[i] / gap;
-        }
-        if bnd[i] <= sixteen * T::eps() * Float::abs(ritz[i]) {
+    } else {
+        if bnd[0] <= sixteen * T::eps() * Float::abs(ritz[0]) {
             neig += 1;
             if !*enough {
-                *enough = endl < ritz[i] && ritz[i] < endr;
+                *enough = endl < ritz[0] && ritz[0] < endr;
             }
         }
     }
@@ -1028,31 +1030,6 @@ fn imtql2<T: SvdFloat>(
     Ok(())
 }
 
-fn rotate_array<T: Float + Copy>(a: &mut [T], x: usize) {
-    let n = a.len();
-    let mut j = 0;
-    let mut start = 0;
-    let mut t1 = a[0];
-
-    for _ in 0..n {
-        j = match j >= x {
-            true => j - x,
-            false => j + n - x,
-        };
-
-        let t2 = a[j];
-        a[j] = t1;
-
-        if j == start {
-            j += 1;
-            start = j;
-            t1 = a[j];
-        } else {
-            t1 = t2;
-        }
-    }
-}
-
 #[allow(non_snake_case)]
 fn ritvec<T: SvdFloat>(
     A: &dyn SMat<T>,
@@ -1066,35 +1043,9 @@ fn ritvec<T: SvdFloat>(
     let js = steps + 1;
     let jsq = js * js;
 
-    let sparsity = T::one()
-        - (T::from_usize(A.nnz()).unwrap()
-            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
-
     let epsilon = <T as Float>::epsilon();
-    let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
-        // For very sparse matrices (>99%), use a more relaxed tolerance
-        epsilon * T::from_f64(100.0).unwrap()
-    } else if sparsity > T::from_f64(0.9).unwrap() {
-        // For moderately sparse matrices (>90%), use a somewhat relaxed tolerance
-        epsilon * T::from_f64(10.0).unwrap()
-    } else {
-        // For less sparse matrices, use standard epsilon
-        epsilon
-    };
-
-    let max_iterations_imtql2 = if sparsity > T::from_f64(0.999).unwrap() {
-        // Ultra sparse (>99.9%) - needs many more iterations
-        Some(500)
-    } else if sparsity > T::from_f64(0.99).unwrap() {
-        // Very sparse (>99%) - needs more iterations
-        Some(300)
-    } else if sparsity > T::from_f64(0.9).unwrap() {
-        // Moderately sparse (>90%) - needs somewhat more iterations
-        Some(200)
-    } else {
-        // Default iterations for less sparse matrices
-        Some(50)
-    };
+    let adaptive_eps = epsilon;
+    let max_iterations_imtql2 = Some(100);
 
     let mut s = vec![T::zero(); jsq];
     // initialize s to an identity matrix
@@ -1126,14 +1077,7 @@ fn ritvec<T: SvdFloat>(
         .iter()
         .fold(T::zero(), |max, &val| Float::max(max, Float::abs(val)));
 
-    let adaptive_kappa = if sparsity > T::from_f64(0.99).unwrap() {
-        // More relaxed kappa for very sparse matrices
-        kappa * T::from_f64(10.0).unwrap()
-    } else {
-        kappa
-    };
-
-    let mut x = dimensions - 1;
+    let adaptive_kappa = kappa;
 
     let store_vectors: Vec<Vec<T>> = (0..js).map(|i| store.retrq(i).to_vec()).collect();
 
@@ -1142,7 +1086,8 @@ fn ritvec<T: SvdFloat>(
         .filter(|&k| {
             let relative_bound =
                 adaptive_kappa * Float::max(Float::abs(wrk.ritz[k]), max_eigenvalue * adaptive_eps);
-            wrk.bnd[k] <= relative_bound && k + 1 > js - neig
+            // Allow values that passed error_bound (neig) or are strictly above the bound
+            wrk.bnd[k] <= relative_bound || k + 1 > js - neig
         })
         .collect();
 
@@ -1271,34 +1216,10 @@ fn lanso<T: SvdFloat>(
     store: &mut Store<T>,
     random_seed: u32,
 ) -> Result<usize, SvdLibError> {
-    let sparsity = T::one()
-        - (T::from_usize(A.nnz()).unwrap()
-            / (T::from_usize(A.nrows()).unwrap() * T::from_usize(A.ncols()).unwrap()));
-    let max_iterations_imtqlb = if sparsity > T::from_f64(0.999).unwrap() {
-        // Ultra sparse (>99.9%) - needs many more iterations
-        Some(500)
-    } else if sparsity > T::from_f64(0.99).unwrap() {
-        // Very sparse (>99%) - needs more iterations
-        Some(300)
-    } else if sparsity > T::from_f64(0.9).unwrap() {
-        // Moderately sparse (>90%) - needs somewhat more iterations
-        Some(100)
-    } else {
-        // Default iterations for less sparse matrices
-        Some(50)
-    };
+    let max_iterations_imtqlb = Some(100);
 
     let epsilon = <T as Float>::epsilon();
-    let adaptive_eps = if sparsity > T::from_f64(0.99).unwrap() {
-        // For very sparse matrices (>99%), use a more relaxed tolerance
-        epsilon * T::from_f64(100.0).unwrap()
-    } else if sparsity > T::from_f64(0.9).unwrap() {
-        // For moderately sparse matrices (>90%), use a somewhat relaxed tolerance
-        epsilon * T::from_f64(10.0).unwrap()
-    } else {
-        // For less sparse matrices, use standard epsilon
-        epsilon
-    };
+    let adaptive_eps = epsilon;
 
     let (endl, endr) = (end_interval[0], end_interval[1]);
 
@@ -1344,7 +1265,7 @@ fn lanso<T: SvdFloat>(
 
         // analyze T
         let mut l = 0;
-        for _ in 0..j {
+        loop {
             if l > j {
                 break;
             }
@@ -1388,13 +1309,7 @@ fn lanso<T: SvdFloat>(
                 last = first + 9;
                 intro = first;
             } else {
-                let extra_steps = if sparsity > T::from_f64(0.99).unwrap() {
-                    5 // For very sparse matrices, add extra steps
-                } else {
-                    0
-                };
-
-                last = first + 3.max(1 + ((j - intro) * (dim - *neig)) / *neig) + extra_steps;
+                last = first + 3.max(1 + ((j - intro) * (dim - *neig)) / *neig);
             }
             last = last.min(iterations);
         } else {
@@ -1413,7 +1328,19 @@ impl<T: SvdFloat + 'static> SvdRec<T> {
     }
 }
 
-impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::csc::CscMatrix<T> {
+impl<
+        T: Float
+            + Zero
+            + AddAssign
+            + SubAssign
+            + Clone
+            + Sync
+            + Send
+            + FromPrimitive
+            + Debug
+            + 'static,
+    > SMat<T> for nalgebra_sparse::csc::CscMatrix<T>
+{
     fn nrows(&self) -> usize {
         self.nrows()
     }
@@ -1453,27 +1380,70 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
 
         let (major_offsets, minor_indices, values) = self.csc_data();
 
-        for y_val in y.iter_mut() {
-            *y_val = T::zero();
-        }
+        y.fill(T::zero());
 
         if transposed {
-            for (i, yval) in y.iter_mut().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    *yval += values[j] * x[minor_indices[j]];
-                }
+            // y[j] = sum_i A[i,j] * x[i]  — gather per col, parallel
+            let results: Vec<(usize, T)> = (0..self.ncols())
+                .into_par_iter()
+                .map(|j| {
+                    let mut sum = T::zero();
+                    for k in major_offsets[j]..major_offsets[j + 1] {
+                        sum += values[k] * x[minor_indices[k]];
+                    }
+                    (j, sum)
+                })
+                .collect();
+
+            for (j, val) in results {
+                y[j] = val;
             }
         } else {
-            for (i, xval) in x.iter().enumerate() {
-                for j in major_offsets[i]..major_offsets[i + 1] {
-                    y[minor_indices[j]] += values[j] * *xval;
+            // y[i] += sum_j A[i,j] * x[j]  — scatter, parallel chunks + reduce
+            let ncols = self.ncols();
+            let chunk_size = crate::utils::determine_chunk_size(ncols);
+
+            let results: Vec<Vec<T>> = (0..((ncols + chunk_size - 1) / chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(ncols);
+
+                    let mut local_y = vec![T::zero(); y.len()];
+                    for j in start..end {
+                        let xj = x[j];
+                        for k in major_offsets[j]..major_offsets[j + 1] {
+                            local_y[minor_indices[k]] += values[k] * xj;
+                        }
+                    }
+                    local_y
+                })
+                .collect();
+
+            for local_y in results {
+                for (idx, val) in local_y.iter().enumerate() {
+                    if !val.is_zero() {
+                        y[idx] += *val;
+                    }
                 }
             }
         }
     }
 
     fn compute_column_means(&self) -> Vec<T> {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let recip = T::from_usize(nrows).unwrap().recip();
+        let (major_offsets, _, values) = self.csc_data();
+
+        (0..ncols)
+            .into_par_iter()
+            .map(|j| {
+                let sum = (major_offsets[j]..major_offsets[j + 1])
+                    .fold(T::zero(), |acc, k| acc + values[k]);
+                sum * recip
+            })
+            .collect()
     }
 
     fn multiply_with_dense(
@@ -1482,7 +1452,62 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
         result: &mut DMatrix<T>,
         transpose_self: bool,
     ) {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let dense_cols = dense.ncols();
+        let (major_offsets, minor_indices, values) = self.csc_data();
+
+        if !transpose_self {
+            // result = A @ dense, shape (nrows, dense_cols) — scatter with reduction
+            let chunk_size = crate::utils::determine_chunk_size(ncols);
+            let partials: Vec<Vec<T>> = (0..ncols.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let col_start = chunk_idx * chunk_size;
+                    let col_end = (col_start + chunk_size).min(ncols);
+                    let mut local = vec![T::zero(); nrows * dense_cols];
+                    for j in col_start..col_end {
+                        for k in major_offsets[j]..major_offsets[j + 1] {
+                            let i = minor_indices[k];
+                            let v = values[k];
+                            for c in 0..dense_cols {
+                                local[i * dense_cols + c] += v * dense[(j, c)];
+                            }
+                        }
+                    }
+                    local
+                })
+                .collect();
+            result.fill(T::zero());
+            for local in partials {
+                for i in 0..nrows {
+                    for c in 0..dense_cols {
+                        result[(i, c)] += local[i * dense_cols + c];
+                    }
+                }
+            }
+        } else {
+            // result = A^T @ dense, shape (ncols, dense_cols) — gather per col
+            let col_results: Vec<(usize, Vec<T>)> = (0..ncols)
+                .into_par_iter()
+                .map(|j| {
+                    let mut row = vec![T::zero(); dense_cols];
+                    for k in major_offsets[j]..major_offsets[j + 1] {
+                        let i = minor_indices[k];
+                        let v = values[k];
+                        for c in 0..dense_cols {
+                            row[c] += v * dense[(i, c)];
+                        }
+                    }
+                    (j, row)
+                })
+                .collect();
+            for (j, row) in col_results {
+                for c in 0..dense_cols {
+                    result[(j, c)] = row[c];
+                }
+            }
+        }
     }
 
     fn multiply_with_dense_centered(
@@ -1492,20 +1517,100 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::cs
         transpose_self: bool,
         means: &DVector<T>,
     ) {
-        todo!()
+        let dense_cols = dense.ncols();
+        if !transpose_self {
+            // result = (A - 1·means^T) @ dense
+            let ncols = self.ncols();
+            let correction: Vec<T> = (0..dense_cols)
+                .map(|c| (0..ncols).fold(T::zero(), |acc, j| acc + means[j] * dense[(j, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, false);
+            let nrows = self.nrows();
+            for i in 0..nrows {
+                for c in 0..dense_cols {
+                    result[(i, c)] -= correction[c];
+                }
+            }
+        } else {
+            // result = (A^T - means·1^T) @ dense
+            let nrows = self.nrows();
+            let ncols = self.ncols();
+            let col_sums: Vec<T> = (0..dense_cols)
+                .map(|c| (0..nrows).fold(T::zero(), |acc, i| acc + dense[(i, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, true);
+            for j in 0..ncols {
+                let mj = means[j];
+                for c in 0..dense_cols {
+                    result[(j, c)] -= mj * col_sums[c];
+                }
+            }
+        }
     }
-    
+
     fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
-        todo!()
+        let ncols = self.ncols();
+        let q_cols = q.ncols();
+        let (major_offsets, minor_indices, values) = self.csc_data();
+
+        // CSC: gather per col — parallel
+        let col_results: Vec<(usize, Vec<T>)> = (0..ncols)
+            .into_par_iter()
+            .map(|j| {
+                let mut col = vec![T::zero(); q_cols];
+                for k in major_offsets[j]..major_offsets[j + 1] {
+                    let i = minor_indices[k];
+                    let v = values[k];
+                    for c in 0..q_cols {
+                        col[c] += q[(i, c)] * v;
+                    }
+                }
+                (j, col)
+            })
+            .collect();
+        result.fill(T::zero());
+        for (j, col) in col_results {
+            for c in 0..q_cols {
+                result[(c, j)] = col[c];
+            }
+        }
     }
-    
-    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
-        todo!()
+
+    fn multiply_transposed_by_dense_centered(
+        &self,
+        q: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        means: &DVector<T>,
+    ) {
+        let q_rows = q.nrows();
+        let q_cols = q.ncols();
+        let ncols = self.ncols();
+        let q_col_sums: Vec<T> = (0..q_cols)
+            .map(|c| (0..q_rows).fold(T::zero(), |acc, i| acc + q[(i, c)]))
+            .collect();
+        self.multiply_transposed_by_dense(q, result);
+        for c in 0..q_cols {
+            let qs = q_col_sums[c];
+            for j in 0..ncols {
+                result[(c, j)] -= qs * means[j];
+            }
+        }
     }
 }
 
-impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SMat<T>
-    for nalgebra_sparse::csr::CsrMatrix<T>
+impl<
+        T: Float
+            + Zero
+            + AddAssign
+            + SubAssign
+            + Clone
+            + Sync
+            + Send
+            + MulAssign
+            + FromPrimitive
+            + Debug
+            + 'static,
+    > SMat<T> for nalgebra_sparse::csr::CsrMatrix<T>
 {
     fn nrows(&self) -> usize {
         self.nrows()
@@ -1519,7 +1624,6 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
 
     /// takes an n-vector x and returns A*x in y
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool) {
-        //TODO parallelize me please
         let nrows = if transposed {
             self.ncols()
         } else {
@@ -1551,7 +1655,7 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
 
         if !transposed {
             let nrows = self.nrows();
-            let chunk_size = crate::utils::determine_chunk_size(nrows);
+            let _chunk_size = crate::utils::determine_chunk_size(nrows);
 
             // Create thread-local vectors with results
             let results: Vec<(usize, T)> = (0..nrows)
@@ -1606,7 +1710,7 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
     fn compute_column_means(&self) -> Vec<T> {
         let rows = self.nrows();
         let cols = self.ncols();
-        let row_count_recip = T::one() / T::from(rows).unwrap();
+        let row_count_recip = T::one() / T::from_usize(rows).unwrap();
 
         let mut col_sums = vec![T::zero(); cols];
         let (row_offsets, col_indices, values) = self.csr_data();
@@ -1633,7 +1737,62 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
         result: &mut DMatrix<T>,
         transpose_self: bool,
     ) {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let dense_cols = dense.ncols();
+        let (major_offsets, minor_indices, values) = self.csr_data();
+
+        if !transpose_self {
+            // result = A @ dense, shape (nrows, dense_cols) — gather per row
+            let row_results: Vec<(usize, Vec<T>)> = (0..nrows)
+                .into_par_iter()
+                .map(|i| {
+                    let mut row = vec![T::zero(); dense_cols];
+                    for k in major_offsets[i]..major_offsets[i + 1] {
+                        let j = minor_indices[k];
+                        let v = values[k];
+                        for c in 0..dense_cols {
+                            row[c] += v * dense[(j, c)];
+                        }
+                    }
+                    (i, row)
+                })
+                .collect();
+            for (i, row) in row_results {
+                for c in 0..dense_cols {
+                    result[(i, c)] = row[c];
+                }
+            }
+        } else {
+            // result = A^T @ dense, shape (ncols, dense_cols) — scatter with reduction
+            let chunk_size = crate::utils::determine_chunk_size(nrows);
+            let partials: Vec<Vec<T>> = (0..nrows.div_ceil(chunk_size))
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let row_start = chunk_idx * chunk_size;
+                    let row_end = (row_start + chunk_size).min(nrows);
+                    let mut local = vec![T::zero(); ncols * dense_cols];
+                    for i in row_start..row_end {
+                        for k in major_offsets[i]..major_offsets[i + 1] {
+                            let j = minor_indices[k];
+                            let v = values[k];
+                            for c in 0..dense_cols {
+                                local[j * dense_cols + c] += v * dense[(i, c)];
+                            }
+                        }
+                    }
+                    local
+                })
+                .collect();
+            result.fill(T::zero());
+            for local in partials {
+                for j in 0..ncols {
+                    for c in 0..dense_cols {
+                        result[(j, c)] += local[j * dense_cols + c];
+                    }
+                }
+            }
+        }
     }
 
     fn multiply_with_dense_centered(
@@ -1643,19 +1802,108 @@ impl<T: Float + Zero + AddAssign + Clone + Sync + Send + std::ops::MulAssign> SM
         transpose_self: bool,
         means: &DVector<T>,
     ) {
-        todo!()
+        let dense_cols = dense.ncols();
+        if !transpose_self {
+            // result = (A - 1·means^T) @ dense
+            let ncols = self.ncols();
+            let correction: Vec<T> = (0..dense_cols)
+                .map(|c| (0..ncols).fold(T::zero(), |acc, j| acc + means[j] * dense[(j, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, false);
+            let nrows = self.nrows();
+            for i in 0..nrows {
+                for c in 0..dense_cols {
+                    result[(i, c)] -= correction[c];
+                }
+            }
+        } else {
+            // result = (A^T - means·1^T) @ dense
+            let nrows = self.nrows();
+            let ncols = self.ncols();
+            let col_sums: Vec<T> = (0..dense_cols)
+                .map(|c| (0..nrows).fold(T::zero(), |acc, i| acc + dense[(i, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, true);
+            for j in 0..ncols {
+                let mj = means[j];
+                for c in 0..dense_cols {
+                    result[(j, c)] -= mj * col_sums[c];
+                }
+            }
+        }
     }
-    
+
     fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let q_cols = q.ncols();
+        let (major_offsets, minor_indices, values) = self.csr_data();
+
+        // Scatter: parallel row chunks, flat partial buffers
+        let chunk_size = crate::utils::determine_chunk_size(nrows);
+        let partials: Vec<Vec<T>> = (0..nrows.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let row_start = chunk_idx * chunk_size;
+                let row_end = (row_start + chunk_size).min(nrows);
+                let mut local = vec![T::zero(); q_cols * ncols];
+                for i in row_start..row_end {
+                    for k in major_offsets[i]..major_offsets[i + 1] {
+                        let j = minor_indices[k];
+                        let v = values[k];
+                        for c in 0..q_cols {
+                            local[c * ncols + j] += q[(i, c)] * v;
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+        result.fill(T::zero());
+        for local in partials {
+            for c in 0..q_cols {
+                for j in 0..ncols {
+                    result[(c, j)] += local[c * ncols + j];
+                }
+            }
+        }
     }
-    
-    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
-        todo!()
+
+    fn multiply_transposed_by_dense_centered(
+        &self,
+        q: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        means: &DVector<T>,
+    ) {
+        let q_rows = q.nrows();
+        let q_cols = q.ncols();
+        let ncols = self.ncols();
+        let q_col_sums: Vec<T> = (0..q_cols)
+            .map(|c| (0..q_rows).fold(T::zero(), |acc, i| acc + q[(i, c)]))
+            .collect();
+        self.multiply_transposed_by_dense(q, result);
+        for c in 0..q_cols {
+            let qs = q_col_sums[c];
+            for j in 0..ncols {
+                result[(c, j)] -= qs * means[j];
+            }
+        }
     }
 }
 
-impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::coo::CooMatrix<T> {
+impl<
+        T: Float
+            + Zero
+            + AddAssign
+            + SubAssign
+            + Clone
+            + Sync
+            + Send
+            + FromPrimitive
+            + Debug
+            + 'static,
+    > SMat<T> for nalgebra_sparse::coo::CooMatrix<T>
+{
     fn nrows(&self) -> usize {
         self.nrows()
     }
@@ -1693,23 +1941,72 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
             nrows
         );
 
-        for y_val in y.iter_mut() {
-            *y_val = T::zero();
-        }
+        y.fill(T::zero());
 
-        if transposed {
-            for (i, j, v) in self.triplet_iter() {
-                y[j] += *v * x[i];
-            }
-        } else {
-            for (i, j, v) in self.triplet_iter() {
-                y[i] += *v * x[j];
+        let row_indices = self.row_indices();
+        let col_indices = self.col_indices();
+        let values = self.values();
+        let nnz = values.len();
+
+        let chunk_size = crate::utils::determine_chunk_size(nnz);
+        let partials: Vec<Vec<T>> = (0..nnz.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nnz);
+                let mut local = vec![T::zero(); y.len()];
+                for k in start..end {
+                    if transposed {
+                        local[col_indices[k]] += values[k] * x[row_indices[k]];
+                    } else {
+                        local[row_indices[k]] += values[k] * x[col_indices[k]];
+                    }
+                }
+                local
+            })
+            .collect();
+
+        for local in partials {
+            for (idx, val) in local.iter().enumerate() {
+                if !val.is_zero() {
+                    y[idx] += *val;
+                }
             }
         }
     }
 
     fn compute_column_means(&self) -> Vec<T> {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let recip = T::from_usize(nrows).unwrap().recip();
+
+        let col_indices = self.col_indices();
+        let values = self.values();
+        let nnz = values.len();
+
+        let chunk_size = crate::utils::determine_chunk_size(nnz);
+        let partial_sums: Vec<Vec<T>> = (0..nnz.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nnz);
+                let mut local = vec![T::zero(); ncols];
+                for k in start..end {
+                    local[col_indices[k]] += values[k];
+                }
+                local
+            })
+            .collect();
+
+        let mut col_sums = vec![T::zero(); ncols];
+        for local in partial_sums {
+            for (j, v) in local.iter().enumerate() {
+                col_sums[j] += *v;
+            }
+        }
+
+        col_sums.iter_mut().for_each(|v| *v = *v * recip);
+        col_sums
     }
 
     fn multiply_with_dense(
@@ -1718,7 +2015,60 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
         result: &mut DMatrix<T>,
         transpose_self: bool,
     ) {
-        todo!()
+        let nrows = self.nrows();
+        let ncols = self.ncols();
+        let dense_cols = dense.ncols();
+
+        let row_indices = self.row_indices();
+        let col_indices = self.col_indices();
+        let values = self.values();
+        let nnz = values.len();
+
+        let chunk_size = crate::utils::determine_chunk_size(nnz);
+        let partials: Vec<Vec<T>> = (0..nnz.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nnz);
+                let mut local = if !transpose_self {
+                    vec![T::zero(); nrows * dense_cols]
+                } else {
+                    vec![T::zero(); ncols * dense_cols]
+                };
+                for k in start..end {
+                    let i = row_indices[k];
+                    let j = col_indices[k];
+                    let v = values[k];
+                    if !transpose_self {
+                        for c in 0..dense_cols {
+                            local[i * dense_cols + c] += v * dense[(j, c)];
+                        }
+                    } else {
+                        for c in 0..dense_cols {
+                            local[j * dense_cols + c] += v * dense[(i, c)];
+                        }
+                    }
+                }
+                local
+            })
+            .collect();
+
+        result.fill(T::zero());
+        for local in partials {
+            if !transpose_self {
+                for i in 0..nrows {
+                    for c in 0..dense_cols {
+                        result[(i, c)] += local[i * dense_cols + c];
+                    }
+                }
+            } else {
+                for j in 0..ncols {
+                    for c in 0..dense_cols {
+                        result[(j, c)] += local[j * dense_cols + c];
+                    }
+                }
+            }
+        }
     }
 
     fn multiply_with_dense_centered(
@@ -1728,14 +2078,91 @@ impl<T: Float + Zero + AddAssign + Clone + Sync> SMat<T> for nalgebra_sparse::co
         transpose_self: bool,
         means: &DVector<T>,
     ) {
-        todo!()
+        let dense_cols = dense.ncols();
+        if !transpose_self {
+            let ncols = self.ncols();
+            let correction: Vec<T> = (0..dense_cols)
+                .map(|c| (0..ncols).fold(T::zero(), |acc, j| acc + means[j] * dense[(j, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, false);
+            let nrows = self.nrows();
+            for i in 0..nrows {
+                for c in 0..dense_cols {
+                    result[(i, c)] -= correction[c];
+                }
+            }
+        } else {
+            let nrows = self.nrows();
+            let ncols = self.ncols();
+            let col_sums: Vec<T> = (0..dense_cols)
+                .map(|c| (0..nrows).fold(T::zero(), |acc, i| acc + dense[(i, c)]))
+                .collect();
+            self.multiply_with_dense(dense, result, true);
+            for j in 0..ncols {
+                let mj = means[j];
+                for c in 0..dense_cols {
+                    result[(j, c)] -= mj * col_sums[c];
+                }
+            }
+        }
     }
-    
+
     fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>) {
-        todo!()
+        let ncols = self.ncols();
+        let q_cols = q.ncols();
+
+        let row_indices = self.row_indices();
+        let col_indices = self.col_indices();
+        let values = self.values();
+        let nnz = values.len();
+
+        let chunk_size = crate::utils::determine_chunk_size(nnz);
+        let partials: Vec<Vec<T>> = (0..nnz.div_ceil(chunk_size))
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(nnz);
+                let mut local = vec![T::zero(); q_cols * ncols];
+                for k in start..end {
+                    let i = row_indices[k];
+                    let j = col_indices[k];
+                    let v = values[k];
+                    for c in 0..q_cols {
+                        local[c * ncols + j] += q[(i, c)] * v;
+                    }
+                }
+                local
+            })
+            .collect();
+
+        result.fill(T::zero());
+        for local in partials {
+            for c in 0..q_cols {
+                for j in 0..ncols {
+                    result[(c, j)] += local[c * ncols + j];
+                }
+            }
+        }
     }
-    
-    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>) {
-        todo!()
+
+    fn multiply_transposed_by_dense_centered(
+        &self,
+        q: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        means: &DVector<T>,
+    ) {
+        let q_rows = q.nrows();
+        let q_cols = q.ncols();
+        let ncols = self.ncols();
+        let q_col_sums: Vec<T> = (0..q_cols)
+            .map(|c| (0..q_rows).fold(T::zero(), |acc, i| acc + q[(i, c)]))
+            .collect();
+        self.multiply_transposed_by_dense(q, result);
+        for c in 0..q_cols {
+            let qs = q_col_sums[c];
+            for j in 0..ncols {
+                result[(c, j)] -= qs * means[j];
+            }
+        }
     }
 }

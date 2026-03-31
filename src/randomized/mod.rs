@@ -7,9 +7,9 @@ use rand::SeedableRng;
 use rand_distr::Normal;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
+use single_utilities::traits::IntoNdarray2;
 use std::ops::Mul;
 use std::time::Instant;
-use single_utilities::traits::IntoNdarray2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PowerIterationNormalizer {
@@ -303,7 +303,7 @@ fn generate_random_matrix<T: SvdFloat + RealField>(
 ) -> DMatrix<T> {
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::seed_from_u64(0),
+        None => StdRng::seed_from_u64(rand::random()),
     };
 
     let normal = Normal::new(0.0, 1.0).unwrap();
@@ -459,7 +459,7 @@ fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker:
     result: &mut DMatrix<T>,
     column_means: &Option<DVector<T>>,
 ) {
-     if column_means.is_none() {
+    if column_means.is_none() {
         multiply_transposed_by_matrix(q, sparse, result);
         return;
     }

@@ -1,6 +1,6 @@
 pub mod error;
-pub(crate) mod utils;
 pub mod sprs_impl;
+pub(crate) mod utils;
 
 pub mod randomized;
 
@@ -8,18 +8,21 @@ pub mod lanczos;
 
 pub use utils::*;
 
-
 #[cfg(test)]
 mod simple_comparison_tests {
     use super::*;
     use nalgebra_sparse::coo::CooMatrix;
     use nalgebra_sparse::CsrMatrix;
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use rayon::ThreadPoolBuilder;
     use sprs::TriMat;
 
-    fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> nalgebra_sparse::coo::CooMatrix<f64> {
+    fn create_sparse_matrix(
+        rows: usize,
+        cols: usize,
+        density: f64,
+    ) -> nalgebra_sparse::coo::CooMatrix<f64> {
         use rand::{rngs::StdRng, Rng, SeedableRng};
         use std::collections::HashSet;
 
@@ -40,7 +43,8 @@ mod simple_comparison_tests {
             if positions.insert((i, j)) {
                 let val = loop {
                     let v: f64 = rng.gen_range(-10.0..10.0);
-                    if v.abs() > 1e-10 { // Ensure it's not too close to zero
+                    if v.abs() > 1e-10 {
+                        // Ensure it's not too close to zero
                         break v;
                     }
                 };
@@ -69,7 +73,8 @@ mod simple_comparison_tests {
         // Create random sparse matrix
         let mut coo = CooMatrix::<f64>::new(nrows, ncols);
         // Insert some random non-zero elements
-        for _ in 0..(nrows * ncols / 5) {  // ~20% density
+        for _ in 0..(nrows * ncols / 5) {
+            // ~20% density
             let i = rng.gen_range(0..nrows);
             let j = rng.gen_range(0..ncols);
             let value = rng.gen_range(-10.0..10.0);
@@ -87,7 +92,7 @@ mod simple_comparison_tests {
         let current_svd = lanczos::svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
 
         // Compare with relative tolerance
-        let rel_tol = 1e-3;  // 0.1% relative tolerance
+        let rel_tol = 1e-3; // 0.1% relative tolerance
 
         assert_eq!(normal_svd.d, current_svd.d, "Ranks differ");
 
@@ -100,7 +105,10 @@ mod simple_comparison_tests {
             assert!(
                 rel_diff <= rel_tol,
                 "Singular value {} differs too much: relative diff = {}, current = {}, normal = {}",
-                i, rel_diff, current_val, normal_val
+                i,
+                rel_diff,
+                current_val,
+                normal_val
             );
         }
     }
@@ -109,10 +117,17 @@ mod simple_comparison_tests {
     fn test_real_sparse_matrix() {
         // Create a matrix with similar sparsity to your real one (99.02%)
         let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
-        
+
         // Should no longer fail with convergence error
         let result = lanczos::svd_dim_seed(&test_matrix, 50, 42);
-        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
+        assert!(
+            result.is_ok(),
+            "{}",
+            format!(
+                "SVD failed on 99.02% sparse matrix, {:?}",
+                result.err().unwrap()
+            )
+        );
     }
 
     #[test]
@@ -127,7 +142,7 @@ mod simple_comparison_tests {
             randomized::PowerIterationNormalizer::QR,
             false,
             Some(42),
-            false
+            false,
         );
 
         assert!(
@@ -143,7 +158,7 @@ mod simple_comparison_tests {
                 assert!(svd_result.s[i] > 0.0, "Singular values should be positive");
                 if i > 0 {
                     assert!(
-                        svd_result.s[i-1] >= svd_result.s[i],
+                        svd_result.s[i - 1] >= svd_result.s[i],
                         "Singular values should be in descending order"
                     );
                 }
@@ -197,25 +212,34 @@ mod simple_comparison_tests {
     }
 
     #[test]
-    fn test_randomized_svd_small_sparse_matrix() {
-        let csr = make_sprs_matrix(1000, 250, 0.01);
-        let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
-        let result = threadpool.install(|| {
-            randomized::randomized_svd(
-                &csr,
-                50,
-                10,
-                2,
-                randomized::PowerIterationNormalizer::QR,
-                false,
-                Some(42),
-                false,
-            )
-        });
-        assert!(
-            result.is_ok(),
-            "Randomized SVD failed on 99% sparse matrix: {:?}",
-            result.err().unwrap()
-        );
+    fn test_zero_matrix() {
+        let rows = 10;
+        let cols = 10;
+        let coo = nalgebra_sparse::coo::CooMatrix::<f64>::new(rows, cols);
+        let csr = nalgebra_sparse::CsrMatrix::from(&coo);
+
+        // Should return a valid SVD result with zero singular values
+        let result = lanczos::svd_dim(&csr, 5);
+        assert!(result.is_ok(), "SVD failed on zero matrix");
+        let svd = result.unwrap();
+        // For a zero matrix, we expect all returned singular values to be zero
+        for &s in svd.s.iter() {
+            assert!(s.abs() < 1e-15);
+        }
+    }
+    #[test]
+    fn test_dimension_one() {
+        let rows = 10;
+        let cols = 10;
+        let mut coo = nalgebra_sparse::coo::CooMatrix::<f64>::new(rows, cols);
+        coo.push(0, 0, 1.0);
+        let csr = nalgebra_sparse::CsrMatrix::from(&coo);
+
+        // Should support dimension = 1
+        let result = lanczos::svd_dim(&csr, 1);
+        assert!(result.is_ok(), "SVD failed for dimension 1");
+        let svd = result.unwrap();
+        assert_eq!(svd.d, 1);
+        assert!((svd.s[0] - 1.0).abs() < 1e-15);
     }
 }

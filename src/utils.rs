@@ -1,11 +1,8 @@
-use rayon::iter::ParallelIterator;
 use nalgebra_sparse::na::{DMatrix, DVector};
-use ndarray::{Array1, Array2, ShapeBuilder};
-use num_traits::{Float, Zero};
-use rayon::prelude::{IntoParallelIterator, IndexedParallelIterator};
+use ndarray::{Array1, Array2};
+use num_traits::Float;
 use single_utilities::traits::FloatOpsTS;
 use std::fmt::Debug;
-use nalgebra::{Dim, Dyn, Scalar};
 
 pub fn determine_chunk_size(nrows: usize) -> usize {
     let num_threads = rayon::current_num_threads();
@@ -25,11 +22,27 @@ pub trait SMat<T: Float> {
     fn nnz(&self) -> usize;
     fn svd_opa(&self, x: &[T], y: &mut [T], transposed: bool); // y = A*x
     fn compute_column_means(&self) -> Vec<T>;
-    fn multiply_with_dense(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool);
-    fn multiply_with_dense_centered(&self, dense: &DMatrix<T>, result: &mut DMatrix<T>, transpose_self: bool, means: &DVector<T>);
+    fn multiply_with_dense(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+    );
+    fn multiply_with_dense_centered(
+        &self,
+        dense: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        transpose_self: bool,
+        means: &DVector<T>,
+    );
 
     fn multiply_transposed_by_dense(&self, q: &DMatrix<T>, result: &mut DMatrix<T>);
-    fn multiply_transposed_by_dense_centered(&self, q: &DMatrix<T>, result: &mut DMatrix<T>, means: &DVector<T>);
+    fn multiply_transposed_by_dense_centered(
+        &self,
+        q: &DMatrix<T>,
+        result: &mut DMatrix<T>,
+        means: &DVector<T>,
+    );
 }
 
 /// Singular Value Decomposition Components
@@ -94,7 +107,7 @@ impl SvdFloat for f32 {
     }
 
     fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f32::EPSILON
+        (b - a).abs() < f32::EPSILON * 10.0
     }
 }
 
@@ -108,6 +121,6 @@ impl SvdFloat for f64 {
     }
 
     fn compare(a: Self, b: Self) -> bool {
-        (b - a).abs() < f64::EPSILON
+        (b - a).abs() < f64::EPSILON * 10.0
     }
 }
