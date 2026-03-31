@@ -22,3 +22,4 @@ thiserror = "2.0.9"
 ndarray = "0.16"
 single-utilities = { version = "0.9.0", features = ["convert"] }
 nalgebra = { version = "0.34", features = ["rayon"] }
+sprs = "0.11.4"

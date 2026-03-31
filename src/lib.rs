@@ -1,6 +1,7 @@
 pub mod legacy;
 pub mod error;
 pub(crate) mod utils;
+pub mod sprs_impl;
 
 pub mod randomized;
 
