@@ -477,17 +477,6 @@ mod randomized_svd_tests {
     use rand::{Rng, SeedableRng};
     use rayon::ThreadPoolBuilder;
     use sprs::TriMat;
-    use std::sync::Once;
-
-    static INIT: Once = Once::new();
-
-    fn setup_thread_pool() {
-        INIT.call_once(|| {
-            // Ignore error — the global pool may have already been initialized
-            // (e.g., by another test that triggered Rayon's lazy init first).
-            let _ = ThreadPoolBuilder::new().num_threads(16).build_global();
-        });
-    }
 
     fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> sprs::CsMat<f64> {
         use std::collections::HashSet;
@@ -525,23 +514,24 @@ mod randomized_svd_tests {
 
     #[test]
     fn test_randomized_svd_accuracy() {
-        setup_thread_pool();
-
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let csr = create_sparse_matrix(500, 40, 0.1);
 
-        let std_svd = crate::lanczos::svd_dim_seed(&csr, 10, 42).unwrap();
-
-        let rand_svd = randomized_svd(
-            &csr,
-            10,
-            5,
-            4,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            true,
-        )
-        .unwrap();
+        let (std_svd, rand_svd) = pool.install(|| {
+            let std_svd = crate::lanczos::svd_dim_seed(&csr, 10, 42).unwrap();
+            let rand_svd = randomized_svd(
+                &csr,
+                10,
+                5,
+                4,
+                PowerIterationNormalizer::QR,
+                false,
+                Some(42),
+                true,
+            )
+            .unwrap();
+            (std_svd, rand_svd)
+        });
 
         assert_eq!(rand_svd.d, 10, "Expected rank of 10");
 
@@ -562,15 +552,12 @@ mod randomized_svd_tests {
                 i, rel_diff, std_svd.s[i], rand_svd.s[i]
             );
         }
-
-
     }
 
     // Test with mean centering
     #[test]
     fn test_randomized_svd_with_mean_centering() {
-        setup_thread_pool();
-
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let mut tri: TriMat<f64> = TriMat::new((30, 10));
         let mut rng = StdRng::seed_from_u64(123);
 
@@ -604,29 +591,31 @@ mod randomized_svd_tests {
 
         let csr: sprs::CsMat<f64> = tri.to_csr();
 
-        let svd_no_center = randomized_svd(
-            &csr,
-            3,
-            3,
-            2,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            false,
-        )
-        .unwrap();
-
-        let svd_with_center = randomized_svd(
-            &csr,
-            3,
-            3,
-            2,
-            PowerIterationNormalizer::QR,
-            true,
-            Some(42),
-            false,
-        )
-        .unwrap();
+        let (svd_no_center, svd_with_center) = pool.install(|| {
+            let svd_no_center = randomized_svd(
+                &csr,
+                3,
+                3,
+                2,
+                PowerIterationNormalizer::QR,
+                false,
+                Some(42),
+                false,
+            )
+            .unwrap();
+            let svd_with_center = randomized_svd(
+                &csr,
+                3,
+                3,
+                2,
+                PowerIterationNormalizer::QR,
+                true,
+                Some(42),
+                false,
+            )
+            .unwrap();
+            (svd_no_center, svd_with_center)
+        });
 
         println!("Singular values without centering: {:?}", svd_no_center.s);
         println!("Singular values with centering: {:?}", svd_with_center.s);
@@ -634,20 +623,21 @@ mod randomized_svd_tests {
 
     #[test]
     fn test_randomized_svd_large_sparse() {
-        setup_thread_pool();
-
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let csr = create_sparse_matrix(5000, 1000, 0.01);
 
-        let result = randomized_svd(
-            &csr,
-            20,
-            10,
-            2,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            false,
-        );
+        let result = pool.install(|| {
+            randomized_svd(
+                &csr,
+                20,
+                10,
+                2,
+                PowerIterationNormalizer::QR,
+                false,
+                Some(42),
+                false,
+            )
+        });
 
         assert!(
             result.is_ok(),
@@ -674,8 +664,7 @@ mod randomized_svd_tests {
     // Test with different power iteration settings
     #[test]
     fn test_power_iteration_impact() {
-        setup_thread_pool();
-
+        let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let mut tri: TriMat<f64> = TriMat::new((100, 50));
         let mut rng = StdRng::seed_from_u64(987);
 
@@ -708,7 +697,6 @@ mod randomized_svd_tests {
         let csr: sprs::CsMat<f64> = tri.to_csr();
 
         let powers = [0, 1, 3, 5];
-        let mut errors = Vec::new();
 
         let mut dense_mat = Array2::<f64>::zeros((100, 50));
         for (&val, (i, j)) in csr.iter() {
@@ -716,33 +704,35 @@ mod randomized_svd_tests {
         }
         let matrix_norm = dense_mat.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
 
-        for &power in &powers {
-            let svd = randomized_svd(
-                &csr,
-                10,
-                5,
-                power,
-                PowerIterationNormalizer::QR,
-                false,
-                Some(42),
-                false,
-            )
-            .unwrap();
+        let errors: Vec<f64> = pool.install(|| {
+            powers
+                .iter()
+                .map(|&power| {
+                    let svd = randomized_svd(
+                        &csr,
+                        10,
+                        5,
+                        power,
+                        PowerIterationNormalizer::QR,
+                        false,
+                        Some(42),
+                        false,
+                    )
+                    .unwrap();
 
-            let recon = svd.recompose();
-            let mut error = 0.0;
-
-            for i in 0..100 {
-                for j in 0..50 {
-                    error += (dense_mat[[i, j]] - recon[[i, j]]).powi(2);
-                }
-            }
-
-            error = error.sqrt() / matrix_norm;
-            errors.push(error);
-
-            println!("Power iterations: {}, Relative error: {}", power, error);
-        }
+                    let recon = svd.recompose();
+                    let mut error = 0.0;
+                    for i in 0..100 {
+                        for j in 0..50 {
+                            error += (dense_mat[[i, j]] - recon[[i, j]]).powi(2);
+                        }
+                    }
+                    let error = error.sqrt() / matrix_norm;
+                    println!("Power iterations: {}, Relative error: {}", power, error);
+                    error
+                })
+                .collect()
+        });
 
         let mut improved = false;
         for i in 1..errors.len() {
