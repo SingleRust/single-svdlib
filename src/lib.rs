@@ -19,6 +19,7 @@ mod simple_comparison_tests {
     use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
     use rayon::ThreadPoolBuilder;
+    use sprs::TriMat;
 
     fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> nalgebra_sparse::coo::CooMatrix<f64> {
         use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -166,10 +167,7 @@ mod simple_comparison_tests {
 
     #[test]
     fn test_random_svd_computation() {
-
-        let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
-
-        let csr = CsrMatrix::from(&test_matrix);
+        let csr = make_sprs_matrix(1000, 250, 0.01);
 
         let result = randomized::randomized_svd(
             &csr,
@@ -182,19 +180,15 @@ mod simple_comparison_tests {
             false
         );
 
-        // Verify the computation succeeds on a highly sparse matrix
         assert!(
             result.is_ok(),
             "Randomized SVD failed on 99% sparse matrix: {:?}",
             result.err().unwrap()
         );
 
-        // Additional checks on the result if successful
         if let Ok(svd_result) = result {
-            // Verify dimensions match expectations
             assert_eq!(svd_result.d, 50, "Expected rank of 50");
 
-            // Verify singular values are positive and in descending order
             for i in 0..svd_result.s.len() {
                 assert!(svd_result.s[i] > 0.0, "Singular values should be positive");
                 if i > 0 {
@@ -205,41 +199,46 @@ mod simple_comparison_tests {
                 }
             }
 
-            // Verify basics of U and V dimensions
-            assert_eq!(svd_result.u.nrows(), 50, "U transpose should have 50 rows");
-            assert_eq!(svd_result.u.ncols(), 1000, "U transpose should have 1000 columns");
-            assert_eq!(svd_result.vt.nrows(), 50, "V transpose should have 50 rows");
-            assert_eq!(svd_result.vt.ncols(), 250, "V transpose should have 250 columns");
-
+            // u is (nrows × rank), vt is (rank × ncols)
+            assert_eq!(svd_result.u.nrows(), 1000, "U should have 1000 rows");
+            assert_eq!(svd_result.u.ncols(), 50, "U should have 50 columns");
+            assert_eq!(svd_result.vt.nrows(), 50, "Vt should have 50 rows");
+            assert_eq!(svd_result.vt.ncols(), 250, "Vt should have 250 columns");
         }
+    }
+
+    fn make_sprs_matrix(nrows: usize, ncols: usize, density: f64) -> sprs::CsMat<f64> {
+        let mut tri: TriMat<f64> = TriMat::new((nrows, ncols));
+        let mut rng = StdRng::seed_from_u64(42);
+        let nnz = ((nrows as f64 * ncols as f64 * density).round() as usize).max(1);
+        let mut positions = std::collections::HashSet::new();
+        while positions.len() < nnz {
+            let i = rng.gen_range(0..nrows);
+            let j = rng.gen_range(0..ncols);
+            if positions.insert((i, j)) {
+                let v: f64 = rng.gen_range(-10.0..10.0);
+                tri.add_triplet(i, j, v);
+            }
+        }
+        tri.to_csr()
     }
 
     #[test]
     fn test_randomized_svd_very_large_sparse_matrix() {
-
-        // Create a very large matrix with high sparsity (99%)
-        let test_matrix = create_sparse_matrix(100000, 2500, 0.01); // 1% non-zeros
-
-        // Convert to CSR for processing
-        let csr = CsrMatrix::from(&test_matrix);
-    
-        // Run randomized SVD with reasonable defaults for a sparse matrix
+        let csr = make_sprs_matrix(100000, 2500, 0.01);
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
             randomized::randomized_svd(
                 &csr,
-                50,                              // target rank
-                10,                              // oversampling parameter
-                7,                               // power iterations
-                randomized::PowerIterationNormalizer::QR,    // use QR normalization
+                50,
+                10,
+                7,
+                randomized::PowerIterationNormalizer::QR,
                 false,
                 Some(42),
-                false// random seed
+                false,
             )
         });
-
-
-        // Simply verify that the computation succeeds on a highly sparse matrix
         assert!(
             result.is_ok(),
             "Randomized SVD failed on 99% sparse matrix: {:?}",
@@ -249,30 +248,20 @@ mod simple_comparison_tests {
 
     #[test]
     fn test_randomized_svd_small_sparse_matrix() {
-
-        // Create a very large matrix with high sparsity (99%)
-        let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
-
-        // Convert to CSR for processing
-        let csr = CsrMatrix::from(&test_matrix);
-
-        // Run randomized SVD with reasonable defaults for a sparse matrix
+        let csr = make_sprs_matrix(1000, 250, 0.01);
         let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
         let result = threadpool.install(|| {
             randomized::randomized_svd(
                 &csr,
-                50,                              // target rank
-                10,                              // oversampling parameter
-                2,                               // power iterations
-                randomized::PowerIterationNormalizer::QR,    // use QR normalization
+                50,
+                10,
+                2,
+                randomized::PowerIterationNormalizer::QR,
                 false,
-                Some(42),                        // random seed
-                false
+                Some(42),
+                false,
             )
         });
-
-
-        // Simply verify that the computation succeeds on a highly sparse matrix
         assert!(
             result.is_ok(),
             "Randomized SVD failed on 99% sparse matrix: {:?}",

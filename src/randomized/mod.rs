@@ -472,12 +472,11 @@ fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker:
 mod randomized_svd_tests {
     use super::*;
     use crate::randomized::{randomized_svd, PowerIterationNormalizer};
-    use nalgebra_sparse::coo::CooMatrix;
-    use nalgebra_sparse::CsrMatrix;
     use ndarray::Array2;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rayon::ThreadPoolBuilder;
+    use sprs::TriMat;
     use std::sync::Once;
 
     static INIT: Once = Once::new();
@@ -493,59 +492,47 @@ mod randomized_svd_tests {
         });
     }
 
-    fn create_sparse_matrix(
-        rows: usize,
-        cols: usize,
-        density: f64,
-    ) -> nalgebra_sparse::coo::CooMatrix<f64> {
+    fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> sprs::CsMat<f64> {
         use std::collections::HashSet;
 
-        let mut coo = nalgebra_sparse::coo::CooMatrix::new(rows, cols);
-
+        let mut tri: TriMat<f64> = TriMat::new((rows, cols));
         let mut rng = StdRng::seed_from_u64(42);
 
-        let nnz = (rows as f64 * cols as f64 * density).round() as usize;
-
-        let nnz = nnz.max(1);
-
+        let nnz = ((rows as f64 * cols as f64 * density).round() as usize).max(1);
         let mut positions = HashSet::new();
 
         while positions.len() < nnz {
-            let i = rng.gen_range(0..rows);
-            let j = rng.gen_range(0..cols);
+            let i = rng.random_range(0..rows);
+            let j = rng.random_range(0..cols);
 
             if positions.insert((i, j)) {
                 let val = loop {
-                    let v: f64 = rng.gen_range(-10.0..10.0);
+                    let v: f64 = rng.random_range(-10.0..10.0);
                     if v.abs() > 1e-10 {
                         break v;
                     }
                 };
-
-                coo.push(i, j, val);
+                tri.add_triplet(i, j, val);
             }
         }
 
-        let actual_density = coo.nnz() as f64 / (rows as f64 * cols as f64);
+        let csr = tri.to_csr();
+        let actual_density = csr.nnz() as f64 / (rows as f64 * cols as f64);
         println!("Created sparse matrix: {} x {}", rows, cols);
         println!("  - Requested density: {:.6}", density);
         println!("  - Actual density: {:.6}", actual_density);
         println!("  - Sparsity: {:.4}%", (1.0 - actual_density) * 100.0);
-        println!("  - Non-zeros: {}", coo.nnz());
-
-        coo
+        println!("  - Non-zeros: {}", csr.nnz());
+        csr
     }
 
     #[test]
     fn test_randomized_svd_accuracy() {
         setup_thread_pool();
 
-        let coo = create_sparse_matrix(500, 40, 0.1);
+        let csr = create_sparse_matrix(500, 40, 0.1);
 
-
-        let csr = CsrMatrix::from(&coo);
-
-        let mut std_svd = crate::lanczos::svd_dim_seed(&csr, 10, 42).unwrap();
+        let std_svd = crate::lanczos::svd_dim_seed(&csr, 10, 42).unwrap();
 
         let rand_svd = randomized_svd(
             &csr,
@@ -587,7 +574,7 @@ mod randomized_svd_tests {
     fn test_randomized_svd_with_mean_centering() {
         setup_thread_pool();
 
-        let mut coo = CooMatrix::<f64>::new(30, 10);
+        let mut tri: TriMat<f64> = TriMat::new((30, 10));
         let mut rng = StdRng::seed_from_u64(123);
 
         let column_means: Vec<f64> = (0..10).map(|i| i as f64 * 2.0).collect();
@@ -597,13 +584,13 @@ mod randomized_svd_tests {
 
         for i in 0..30 {
             for j in 0..3 {
-                u[i][j] = rng.gen_range(-1.0..1.0);
+                u[i][j] = rng.random_range(-1.0..1.0);
             }
         }
 
         for i in 0..10 {
             for j in 0..3 {
-                v[i][j] = rng.gen_range(-1.0..1.0);
+                v[i][j] = rng.random_range(-1.0..1.0);
             }
         }
 
@@ -613,12 +600,12 @@ mod randomized_svd_tests {
                 for k in 0..3 {
                     val += u[i][k] * v[j][k];
                 }
-                val = val + column_means[j] + rng.gen_range(-0.1..0.1);
-                coo.push(i, j, val);
+                val = val + column_means[j] + rng.random_range(-0.1..0.1);
+                tri.add_triplet(i, j, val);
             }
         }
 
-        let csr = CsrMatrix::from(&coo);
+        let csr: sprs::CsMat<f64> = tri.to_csr();
 
         let svd_no_center = randomized_svd(
             &csr,
@@ -652,9 +639,7 @@ mod randomized_svd_tests {
     fn test_randomized_svd_large_sparse() {
         setup_thread_pool();
 
-        let test_matrix = create_sparse_matrix(5000, 1000, 0.01);
-
-        let csr = CsrMatrix::from(&test_matrix);
+        let csr = create_sparse_matrix(5000, 1000, 0.01);
 
         let result = randomized_svd(
             &csr,
@@ -694,7 +679,7 @@ mod randomized_svd_tests {
     fn test_power_iteration_impact() {
         setup_thread_pool();
 
-        let mut coo = CooMatrix::<f64>::new(100, 50);
+        let mut tri: TriMat<f64> = TriMat::new((100, 50));
         let mut rng = StdRng::seed_from_u64(987);
 
         let mut u = vec![vec![0.0; 10]; 100];
@@ -719,18 +704,18 @@ mod randomized_svd_tests {
                     val += u[i][k] * v[j][k];
                 }
                 val += rng.random_range(-0.01..0.01);
-                coo.push(i, j, val);
+                tri.add_triplet(i, j, val);
             }
         }
 
-        let csr = CsrMatrix::from(&coo);
+        let csr: sprs::CsMat<f64> = tri.to_csr();
 
         let powers = [0, 1, 3, 5];
         let mut errors = Vec::new();
 
         let mut dense_mat = Array2::<f64>::zeros((100, 50));
-        for (i, j, val) in csr.triplet_iter() {
-            dense_mat[[i, j]] = *val;
+        for (&val, (i, j)) in csr.iter() {
+            dense_mat[[i, j]] = val;
         }
         let matrix_norm = dense_mat.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
 
