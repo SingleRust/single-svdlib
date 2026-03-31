@@ -49,7 +49,11 @@ where
                 masked_to_original.push(i);
             }
         }
-        Self { matrix, masked_to_original, original_to_masked }
+        Self {
+            matrix,
+            masked_to_original,
+            original_to_masked,
+        }
     }
 
     /// Build a masked view from an explicit list of column indices to include.
@@ -93,12 +97,18 @@ where
             (masked_ncols, nrows)
         };
         assert_eq!(
-            x.len(), x_len,
-            "svd_opa: x length mismatch: x={}, expected={}", x.len(), x_len
+            x.len(),
+            x_len,
+            "svd_opa: x length mismatch: x={}, expected={}",
+            x.len(),
+            x_len
         );
         assert_eq!(
-            y.len(), y_len,
-            "svd_opa: y length mismatch: y={}, expected={}", y.len(), y_len
+            y.len(),
+            y_len,
+            "svd_opa: y length mismatch: y={}, expected={}",
+            y.len(),
+            y_len
         );
         y.fill(T::zero());
 
@@ -113,16 +123,14 @@ where
                 let results: Vec<(usize, T)> = (0..nrows)
                     .into_par_iter()
                     .map(|i| {
-                        let sum = (indptr[i].index()..indptr[i + 1].index()).fold(
-                            T::zero(),
-                            |acc, k| {
+                        let sum =
+                            (indptr[i].index()..indptr[i + 1].index()).fold(T::zero(), |acc, k| {
                                 let j = indices[k].index();
                                 match self.original_to_masked[j] {
                                     Some(mj) => acc + data[k] * x[mj],
                                     None => acc,
                                 }
-                            },
-                        );
+                            });
                         (i, sum)
                     })
                     .collect();
@@ -564,7 +572,10 @@ mod tests {
     fn assert_mat_close(m: &DMatrix<f64>, expected: &[(usize, usize, f64)]) {
         for &(i, j, e) in expected {
             let a = m[(i, j)];
-            assert!((a - e).abs() < 1e-10, "m[{i},{j}]: actual={a}, expected={e}");
+            assert!(
+                (a - e).abs() < 1e-10,
+                "m[{i},{j}]: actual={a}, expected={e}"
+            );
         }
     }
 
@@ -659,9 +670,12 @@ mod tests {
         assert_mat_close(
             &result,
             &[
-                (0, 0, 2.0),  (0, 1, 4.0),
-                (1, 0, 12.0), (1, 1, 16.0),
-                (2, 0, 23.0), (2, 1, 34.0),
+                (0, 0, 2.0),
+                (0, 1, 4.0),
+                (1, 0, 12.0),
+                (1, 1, 16.0),
+                (2, 0, 23.0),
+                (2, 1, 34.0),
             ],
         );
     }
@@ -675,10 +689,7 @@ mod tests {
         masked.multiply_with_dense(&dense, &mut result, true);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 27.0), (0, 1, 34.0),
-                (1, 0, 42.0), (1, 1, 52.0),
-            ],
+            &[(0, 0, 27.0), (0, 1, 34.0), (1, 0, 42.0), (1, 1, 52.0)],
         );
     }
 
@@ -692,9 +703,12 @@ mod tests {
         assert_mat_close(
             &result,
             &[
-                (0, 0, 2.0),  (0, 1, 4.0),
-                (1, 0, 12.0), (1, 1, 16.0),
-                (2, 0, 23.0), (2, 1, 34.0),
+                (0, 0, 2.0),
+                (0, 1, 4.0),
+                (1, 0, 12.0),
+                (1, 1, 16.0),
+                (2, 0, 23.0),
+                (2, 1, 34.0),
             ],
         );
     }
@@ -708,10 +722,7 @@ mod tests {
         masked.multiply_with_dense(&dense, &mut result, true);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 27.0), (0, 1, 34.0),
-                (1, 0, 42.0), (1, 1, 52.0),
-            ],
+            &[(0, 0, 27.0), (0, 1, 34.0), (1, 0, 42.0), (1, 1, 52.0)],
         );
     }
 
@@ -734,9 +745,12 @@ mod tests {
         assert_mat_close(
             &result,
             &[
-                (0, 0, -1.5), (0, 1, -1.0),
-                (1, 0, 8.5),  (1, 1, 11.0),
-                (2, 0, 19.5), (2, 1, 29.0),
+                (0, 0, -1.5),
+                (0, 1, -1.0),
+                (1, 0, 8.5),
+                (1, 1, 11.0),
+                (2, 0, 19.5),
+                (2, 1, 29.0),
             ],
         );
     }
@@ -756,10 +770,7 @@ mod tests {
         masked.multiply_with_dense_centered(&dense, &mut result, true, &means);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 22.5), (0, 1, 28.0),
-                (1, 0, 33.0), (1, 1, 40.0),
-            ],
+            &[(0, 0, 22.5), (0, 1, 28.0), (1, 0, 33.0), (1, 1, 40.0)],
         );
     }
 
@@ -780,10 +791,7 @@ mod tests {
         masked.multiply_transposed_by_dense(&q, &mut result);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 27.0), (0, 1, 42.0),
-                (1, 0, 34.0), (1, 1, 52.0),
-            ],
+            &[(0, 0, 27.0), (0, 1, 42.0), (1, 0, 34.0), (1, 1, 52.0)],
         );
     }
 
@@ -796,10 +804,7 @@ mod tests {
         masked.multiply_transposed_by_dense(&q, &mut result);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 27.0), (0, 1, 42.0),
-                (1, 0, 34.0), (1, 1, 52.0),
-            ],
+            &[(0, 0, 27.0), (0, 1, 42.0), (1, 0, 34.0), (1, 1, 52.0)],
         );
     }
 
@@ -821,10 +826,7 @@ mod tests {
         masked.multiply_transposed_by_dense_centered(&q, &mut result, &means);
         assert_mat_close(
             &result,
-            &[
-                (0, 0, 22.5), (0, 1, 33.0),
-                (1, 0, 28.0), (1, 1, 40.0),
-            ],
+            &[(0, 0, 22.5), (0, 1, 33.0), (1, 0, 28.0), (1, 1, 40.0)],
         );
     }
 
@@ -855,7 +857,8 @@ mod tests {
             assert!(
                 (svd_masked.s[i] - svd_physical.s[i]).abs() < 1e-10,
                 "singular value {i} differs: masked={}, physical={}",
-                svd_masked.s[i], svd_physical.s[i]
+                svd_masked.s[i],
+                svd_physical.s[i]
             );
         }
     }

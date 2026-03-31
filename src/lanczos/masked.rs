@@ -1,12 +1,10 @@
-use crate::{determine_chunk_size, SMat, SvdFloat};
+use crate::{determine_chunk_size, SMat};
 use nalgebra_sparse::na::{DMatrix, DVector};
 use nalgebra_sparse::CsrMatrix;
 use num_traits::Float;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
-use rayon::prelude::{
-    IntoParallelIterator, IntoParallelRefIterator, ParallelBridge, ParallelSliceMut,
-};
+use rayon::prelude::{IntoParallelIterator, ParallelSliceMut};
 use std::fmt::Debug;
 use std::ops::AddAssign;
 
@@ -701,14 +699,15 @@ impl<
                         // Process all non-zeros in this row
                         for idx in major_offsets[row]..major_offsets[row + 1] {
                             let original_col = minor_indices[idx];
-                            
+
                             // Check if this column is in our mask
                             if let Some(masked_col) = self.original_to_masked[original_col] {
                                 let sparse_val = values[idx];
 
                                 // Accumulate: local_result[q_col, masked_col] += q[row, q_col] * sparse_val
                                 for q_col in 0..q_cols {
-                                    local_result[(q_col, masked_col)] += q[(row, q_col)] * sparse_val;
+                                    local_result[(q_col, masked_col)] +=
+                                        q[(row, q_col)] * sparse_val;
                                 }
                             }
                         }
@@ -783,17 +782,15 @@ impl<
         // Pre-compute column sums of Q - following the pattern from multiply_with_dense_centered
         let q_col_sums: Vec<T> = (0..q_cols)
             .into_par_iter()
-            .map(|col| {
-                (0..q_rows).map(|row| q[(row, col)]).sum()
-            })
+            .map(|col| (0..q_rows).map(|row| q[(row, col)]).sum())
             .collect();
 
         // Pre-compute mean adjustments for each masked column
         // For Q^T * (A - means): result[q_col, masked_col] = Q^T * A - sum(Q[q_col]) * means[masked_col]
-        let mean_adjustments: Vec<T> = q_col_sums
+        let _mean_adjustments: Vec<T> = q_col_sums
             .iter()
             .enumerate()
-            .map(|(q_col, &q_sum)| {
+            .map(|(_q_col, &q_sum)| {
                 means
                     .iter()
                     .enumerate()
@@ -824,7 +821,7 @@ impl<
                     // Process all non-zeros in this row
                     for idx in major_offsets[row]..major_offsets[row + 1] {
                         let original_col = minor_indices[idx];
-                        
+
                         // Check if this column is in our mask
                         if let Some(masked_col) = self.original_to_masked[original_col] {
                             let sparse_val = values[idx];
@@ -843,7 +840,8 @@ impl<
                 for q_col in 0..q_cols {
                     let q_sum = q_col_sums[q_col];
                     for masked_col in 0..masked_cols {
-                        local_result[(q_col, masked_col)] -= q_sum * means[masked_col] * chunk_fraction;
+                        local_result[(q_col, masked_col)] -=
+                            q_sum * means[masked_col] * chunk_fraction;
                     }
                 }
 
