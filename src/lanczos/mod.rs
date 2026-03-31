@@ -1079,8 +1079,6 @@ fn ritvec<T: SvdFloat>(
 
     let adaptive_kappa = kappa;
 
-    let store_vectors: Vec<Vec<T>> = (0..js).map(|i| store.retrq(i).to_vec()).collect();
-
     let significant_indices: Vec<usize> = (0..js)
         .into_par_iter()
         .filter(|&k| {
@@ -1093,23 +1091,30 @@ fn ritvec<T: SvdFloat>(
 
     let nsig = significant_indices.len();
 
-    let mut vt_vectors: Vec<(usize, Vec<T>)> = significant_indices
-        .into_par_iter()
-        .map(|k| {
-            let mut vec = vec![T::zero(); wrk.ncols];
+    // Pre-allocate all significant vectors
+    let mut vt_vecs: Vec<Vec<T>> = (0..nsig).map(|_| vec![T::zero(); wrk.ncols]).collect();
 
-            for i in 0..js {
-                let idx = k * js + i;
-
-                if Float::abs(s[idx]) > adaptive_eps {
-                    for (j, item) in store_vectors[i].iter().enumerate().take(wrk.ncols) {
-                        vec[j] += s[idx] * *item;
-                    }
+    // For each Krylov vector q_i, add its contribution to all singular vectors
+    // s[k, i] is the i-th component of the k-th eigenvector.
+    // v_k = sum_i s[k, i] * q_i
+    for i in 0..js {
+        let q = store.retrq(i);
+        
+        // Parallelize updates across singular vectors for this q_i
+        vt_vecs.par_iter_mut().enumerate().for_each(|(idx, v_out)| {
+            let k = significant_indices[idx];
+            let s_ki = s[k * js + i];
+            if Float::abs(s_ki) > adaptive_eps {
+                for (j, &q_val) in q.iter().enumerate().take(wrk.ncols) {
+                    v_out[j] += s_ki * q_val;
                 }
             }
+        });
+    }
 
-            (k, vec)
-        })
+    let mut vt_vectors: Vec<(usize, Vec<T>)> = significant_indices
+        .into_iter()
+        .zip(vt_vecs.into_iter())
         .collect();
 
     // Sort by k value to maintain original order
