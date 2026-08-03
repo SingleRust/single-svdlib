@@ -1,175 +1,335 @@
-# Single-SVDLib: Singular Value Decomposition for Sparse Matrices
+# single-svdlib
 
 [![Crate](https://img.shields.io/crates/v/single-svdlib.svg)](https://crates.io/crates/single-svdlib)
 [![Documentation](https://docs.rs/single-svdlib/badge.svg)](https://docs.rs/single-svdlib)
-[![License](https://img.shields.io/crates/l/single-svdlib.svg)](LICENSE)
 
-A high-performance Rust library for computing Singular Value Decomposition (SVD) on sparse matrices, with support for both Lanczos and randomized SVD algorithms.
-
-## Features
-
-- **Multiple SVD algorithms**:
-    - Lanczos algorithm (based on SVDLIBC)
-    - Randomized SVD for very large and sparse matrices
-- **Sparse matrix support**:
-    - Compressed Sparse Row (CSR) format
-    - Compressed Sparse Column (CSC) format
-    - Coordinate (COO) format
-- **Performance optimizations**:
-    - Parallel execution with Rayon
-    - Adaptive tuning for highly sparse matrices
-    - Column masking for subspace SVD
-- **Generic interface**:
-    - Works with both `f32` and `f64` precision
-- **Comprehensive error handling and diagnostics**
-
-## Installation
-
-Add this to your `Cargo.toml`:
+Sparse singular value decomposition in Rust, over [`sprs`](https://crates.io/crates/sprs)
+matrices.
 
 ```toml
 [dependencies]
-single-svdlib = "0.6.0"
+single-svdlib = "2.0"
 ```
 
-## Quick Start
+## Quick start
 
 ```rust
-use nalgebra_sparse::{coo::CooMatrix, csr::CsrMatrix};
-use single_svdlib::laczos::svd_dim_seed;
+use single_svdlib::{sprs::TriMatI, SvdMat};
 
-// Create a matrix in COO format
-let mut coo = CooMatrix::<f64>::new(3, 3);
-coo.push(0, 0, 1.0); coo.push(0, 1, 16.0); coo.push(0, 2, 49.0);
-coo.push(1, 0, 4.0); coo.push(1, 1, 25.0); coo.push(1, 2, 64.0);
-coo.push(2, 0, 9.0); coo.push(2, 1, 36.0); coo.push(2, 2, 81.0);
+let mut tri = TriMatI::<f64, u32>::new((4, 3));
+tri.add_triplet(0, 0, 1.0);
+tri.add_triplet(1, 1, 2.0);
+tri.add_triplet(2, 2, 3.0);
+tri.add_triplet(3, 0, 4.0);
+let a: SvdMat<f64> = tri.to_csr::<u64>();
 
-// Convert to CSR for better performance
-let csr = CsrMatrix::from(&coo);
+// The two largest singular triplets.
+let svd = single_svdlib::svd(&a, 2)?;
 
-// Compute SVD with a fixed random seed
-let svd = svd_dim_seed(&csr, 3, 42).unwrap();
-
-// Access the results
-let singular_values = &svd.s;
-let left_singular_vectors = &svd.ut;  // Note: These are transposed
-let right_singular_vectors = &svd.vt; // Note: These are transposed
-
-// Reconstruct the original matrix
-let reconstructed = svd.recompose();
+// A ≈ u · diag(s) · vt
+assert_eq!(svd.u.dim(),  (4, 2));  // left vectors are columns
+assert_eq!(svd.vt.dim(), (2, 3));  // right vectors are rows
+# Ok::<(), single_svdlib::SvdLibError>(())
 ```
 
-## SVD Methods
+## Choosing a solver
 
-### Lanczos Algorithm (LAS2)
+| module | method | use when |
+|---|---|---|
+| `irlba` | thick-restarted Lanczos bidiagonalization | **default.** Accurate; memory bounded by the requested rank |
+| `randomized` | randomized range finder — power iteration or block Krylov | very large inputs where an approximation is acceptable |
+| `lanczos` | LAS2 from SVDLIBC | **deprecated — numerically unreliable.** See [below](#las2-is-deprecated) |
 
-The Lanczos algorithm is well-suited for sparse matrices of moderate size:
+`single_svdlib::svd` dispatches to `irlba`.
 
 ```rust
-use single_svdlib::laczos;
+use single_svdlib::{irlba, randomized};
+# use single_svdlib::{sprs::TriMatI, SvdMat};
+# let mut t = TriMatI::<f64, u32>::new((40, 20));
+# for i in 0..40 { for j in 0..20 { t.add_triplet(i, j, ((i * 7 + j * 3) % 11) as f64); } }
+# let a: SvdMat<f64> = t.to_csr::<u64>();
 
-// Basic SVD computation (uses defaults)
-let svd = laczos::svd(&matrix)?;
+// Reproducible.
+let exact = irlba::svd_seed(&a, 10, 42)?;
 
-// SVD with specified target rank
-let svd = laczos::svd_dim(&matrix, 10)?;
+// PCA: mean-centered, without ever densifying the matrix.
+let pca = irlba::svd_centered(&a, 10, Some(42))?;
 
-// SVD with specified target rank and fixed random seed
-let svd = laczos::svd_dim_seed(&matrix, 10, 42)?;
+// Approximate, for when the matrix is too large to iterate on.
+let approx = randomized::svd_seed(&a, 10, 42)?;
 
-// Full control over SVD parameters
-let svd = laczos::svd_las2(
-    &matrix,
-    dimensions,    // upper limit of desired number of dimensions
-    iterations,    // number of Lanczos iterations
-    end_interval,  // interval containing unwanted eigenvalues, e.g. [-1e-30, 1e-30]
-    kappa,         // relative accuracy of eigenvalues, e.g. 1e-6
-    random_seed,   // random seed (0 for automatic)
-)?;
+// Block Krylov: much more accurate when the spectrum decays slowly.
+let better = randomized::svd_block_krylov(&a, 10, 3, Some(42))?;
+# Ok::<(), single_svdlib::SvdLibError>(())
 ```
 
-### Randomized SVD
-
-For very large sparse matrices, the randomized SVD algorithm offers better performance:
+Full control is available through `IrlbaConfig` and `RandomizedConfig`:
 
 ```rust
-use single_svdlib::randomized;
+use single_svdlib::randomized::{svd_with, Normalizer, RandomizedConfig};
+# use single_svdlib::{sprs::TriMatI, SvdMat};
+# let mut t = TriMatI::<f64, u32>::new((40, 20));
+# for i in 0..40 { for j in 0..20 { t.add_triplet(i, j, ((i * 5 + j) % 7) as f64); } }
+# let a: SvdMat<f64> = t.to_csr::<u64>();
 
-let svd = randomized::randomized_svd(
-    &matrix,
-    target_rank,                         // desired rank
-    n_oversamples,                       // oversampling parameter (typically 5-10)
-    n_power_iterations,                  // number of power iterations (typically 2-4)
-    randomized::PowerIterationNormalizer::QR,  // normalization method
-    Some(42),                           // random seed (None for automatic)
-)?;
+let cfg = RandomizedConfig::new(10)
+    .oversamples(15)
+    .power_iterations(4)
+    .normalizer(Normalizer::Tsqr)
+    .mean_center(true)
+    .seed(42);
+
+// The last argument is an optional progress sink, called once per stage.
+let svd = svd_with(&a, &cfg, Some(&|stage: &str| eprintln!("{stage}")))?;
+# Ok::<(), single_svdlib::SvdLibError>(())
 ```
 
-### Column Masking
+## Memory
 
-For operations on specific columns of a matrix:
+Two things keep the footprint down.
 
-```rust
-use single_svdlib::laczos::masked::MaskedCSRMatrix;
+**Narrow indices.** `SvdMat<T>` is `CsMatI<T, u32, u64>`: 32-bit column indices with
+64-bit row pointers. Against `usize` for both that is 12 bytes per non-zero instead of
+16 for `f64` data, and 8 instead of 16 for `f32`. The split pointer width keeps matrices
+with more than `u32::MAX` non-zeros representable. Widen by naming the parameters:
+`SvdMat<f64, u64, u64>`.
 
-// Create a mask for selected columns
-let columns = vec![0, 2, 5, 7];  // Only use these columns
-let masked_matrix = MaskedCSRMatrix::with_columns(&csr_matrix, &columns);
+**A bounded basis.** `irlba` restarts, so it holds exactly `work + 1` right vectors and
+`work` left vectors (`work = rank + 7` by default) however many restarts convergence
+takes. Peak is therefore known before the solve begins:
 
-// Compute SVD on the masked matrix
-let svd = laczos::svd(&masked_matrix)?;
+```text
+(work + 1) · cols + work · rows   scalars
 ```
 
-## Result Structure
+Measured on a 200 000 × 30 000 matrix with 4.9M non-zeros, rank 50, 10 cores:
 
-The SVD result contains:
+| | time | peak RSS |
+|---|---|---|
+| `irlba` | 2.2 s | 514 MiB |
+| `randomized`, 2 power iterations | 1.2 s | 654 MiB |
+| `randomized`, block Krylov ×3 | 4.0 s | 1080 MiB |
+
+The matrix itself is 57.8 MiB, against 76.6 MiB with `usize` indices. Reproduce with:
+
+```bash
+cargo run --release --example scale irlba
+```
+
+Block Krylov's basis is `blocks × (rank + oversamples)` columns wide, so its memory
+scales with `blocks` — that is the price of its accuracy.
+
+## Sparse × dense products
+
+A compressed matrix can only be traversed along its outer dimension, which makes the two
+product directions genuinely different:
+
+- `A · D` on a CSR matrix writes output row `i` from sparse row `i`. Threads own disjoint
+  rows, so it needs **no scratch and no reduction**.
+- `Aᵀ · D` scatters, so threads collide and accumulation is unavoidable.
+
+`transpose_view()` does not escape this — it relabels a CSR matrix as a CSC view of the
+transpose without changing which dimension is traversable. What it does buy is that a
+**CSC-stored** matrix gets the disjoint kernel for `Aᵀ · D` for free. If your workload is
+transpose-heavy, store CSC.
+
+For the scatter direction the accumulator count is the *thread* count, and if
+`threads × cols × k` would still exceed `DEFAULT_SCRATCH_BUDGET` (64 MiB) the dense
+columns are processed in blocks so the bound always holds.
+
+## Accuracy
+
+The reduced factors these methods produce — IRLBA's `B`, the randomized path's `R` —
+inherit their conditioning from the operand, and their factorization decides the accuracy
+of the whole result. They are therefore factored with a **one-sided Jacobi SVD**, which is
+accurate to the condition number *after* column scaling (Demmel & Veselić), rather than
+with the bidiagonal QR a linear-algebra backend provides. On a `5 × 2` operand with
+`κ ≈ 8·10⁶`, `nalgebra`'s Golub–Reinsch reconstructed to only `1.3·10⁻⁹` relative;
+Jacobi reaches `< 1·10⁻¹⁵` on the same input. That is also why the crate has no
+linear-algebra backend dependency — `sprs`, `ndarray`, `rayon`, `num-traits`, `rand` and
+`thiserror` are the whole tree.
+
+Correctness is checked three ways:
+
+- **Unit and integration tests** compare every solver against a dense LAPACK-grade
+  reference on fixed fixtures.
+- **Adversarial tests** (`tests/robustness.rs`) assert that degenerate and hostile
+  operands — all-zero, rank-deficient, duplicated rows, `NaN`, `∞`, 12-orders-of-magnitude
+  dynamic range, empty masks — produce either a correct answer or a typed error, never a
+  panic, a hang, or a silently wrong result.
+- **Property tests** (`tests/properties.rs`) check invariants over shapes, densities and
+  value distributions that `proptest` chooses: agreement with the dense reference,
+  orthonormality, `A·vᵢ = σᵢ·uᵢ`, truncation error equal to the spectral tail,
+  storage-order and index-width invariance, and reproducibility. Run them harder with
+  `PROPTEST_CASES=100000 cargo test --release --test properties`.
+
+## Large matrices, column subsets, PCA
+
+The workload this crate is built for: reduce a very large sparse matrix, restricted to a
+subset of columns, without densifying or modifying it.
 
 ```rust
-struct SvdRec<T> {
-    d: usize,              // Rank (number of singular values)
-    ut: Array2<T>,         // Transpose of left singular vectors (d x m)
-    s: Array1<T>,          // Singular values (d)
-    vt: Array2<T>,         // Transpose of right singular vectors (d x n)
-    diagnostics: Diagnostics<T>,  // Computation diagnostics
+use single_svdlib::{irlba, MaskedCsMat};
+# use single_svdlib::{sprs::TriMatI, SvdMat};
+# let mut t = TriMatI::<f64, u32>::new((200, 60));
+# for i in 0..200 { for j in 0..60 { t.add_triplet(i, j, ((i * 7 + j) % 13) as f64); } }
+# let counts: SvdMat<f64> = t.to_csr::<u64>();
+# let selected_genes: Vec<usize> = (0..60).step_by(3).collect();
+
+// A view over the selected columns. No copy; `counts` is untouched.
+let view = MaskedCsMat::with_columns(&counts, &selected_genes);
+
+// PCA of that submatrix: centered implicitly, never densified.
+let pca = irlba::svd_centered(&view, 10, Some(42))?;
+// pca.u  — scores,   cells x components
+// pca.vt — loadings, components x selected genes
+# Ok::<(), single_svdlib::SvdLibError>(())
+```
+
+Measured on **1 000 000 cells × 30 000 genes**, 145M non-zeros, masked to 2238 genes,
+50 components (`cargo run --release --example pca_at_scale`):
+
+| | |
+|---|---|
+| matrix, sparse | 1.63 GiB |
+| the same matrix dense | 223.52 GiB — **137× larger**, never materialised |
+| building the view | 5 ms, no copy |
+| PCA on the view | 44 s, converged |
+| peak RSS | ~3.9 GiB |
+| `‖A_c·vᵢ − σᵢ·uᵢ‖ / σ_max` | 1.8e-15 |
+
+### Two things worth knowing
+
+**A column mask does not make products cheaper.** Every product still walks all the
+source's non-zeros and tests each against the mask; only the output width shrinks. If the
+mask is restrictive and you are running an iterative solver — hundreds of products —
+extract the submatrix once instead. It stays sparse, and the copy is repaid immediately:
+
+```rust
+# use single_svdlib::{irlba, MaskedCsMat, sprs::TriMatI, SvdMat};
+# let mut t = TriMatI::<f64, u32>::new((200, 60));
+# for i in 0..200 { for j in 0..60 { t.add_triplet(i, j, ((i * 7 + j) % 13) as f64); } }
+# let counts: SvdMat<f64> = t.to_csr::<u64>();
+# let selected_genes: Vec<usize> = (0..60).step_by(3).collect();
+let sub = MaskedCsMat::with_columns(&counts, &selected_genes).to_sparse();
+let pca = irlba::svd_centered(&sub, 10, Some(42))?;
+# Ok::<(), single_svdlib::SvdLibError>(())
+```
+
+At 1M × 30k the extraction took 146 ms and made the PCA 18% faster (44 s → 36 s).
+
+**An unconverged result is an error, not a return value.** `irlba` refuses to hand back
+triplets that did not reach `tol`, because a pipeline that forgets to inspect the
+diagnostics would otherwise carry a silently degraded decomposition into everything
+downstream. The error says what the residual was and what to change. If a best effort is
+genuinely what you want, call `.allow_unconverged()` and check
+[`SvdRec::converged`] / [`SvdRec::max_residual`] yourself.
+
+**Raise `work` on tall matrices.** Re-orthogonalisation, not the sparse products,
+dominates when there are many rows. See [`IrlbaConfig::work`] — `rank + 30` was 2.2×
+faster than the default at identical accuracy. `cargo run --release --example tune` prints
+the comparison for your own shape.
+
+## Column masking
+
+Run a solver on a subset of columns without materialising the submatrix:
+
+```rust
+use single_svdlib::MaskedCsMat;
+# use single_svdlib::{sprs::TriMatI, SvdMat};
+# let mut t = TriMatI::<f64, u32>::new((60, 20));
+# for i in 0..60 { for j in 0..20 { t.add_triplet(i, j, ((i + j * 3) % 5) as f64); } }
+# let a: SvdMat<f64> = t.to_csr::<u64>();
+
+let masked = MaskedCsMat::with_columns(&a, &[0, 2, 5, 7]);
+let svd = single_svdlib::svd(&masked, 3)?;
+assert_eq!(svd.vt.ncols(), 4); // one column per selected index
+# Ok::<(), single_svdlib::SvdLibError>(())
+```
+
+## Result
+
+```rust,ignore
+pub struct SvdRec<T> {
+    pub d: usize,          // number of triplets returned
+    pub u: Array2<T>,      // m × d, left vectors are columns
+    pub s: Array1<T>,      // d, descending
+    pub vt: Array2<T>,     // d × n, right vectors are rows
+    pub diagnostics: Diagnostics<T>,
 }
 ```
 
-Note that `ut` and `vt` are returned in transposed form.
+`A ≈ u · diag(s) · vt`, matching `numpy.linalg.svd`. `Diagnostics` carries a `matvecs`
+count — sparse products issued, with a block product against `k` dense columns counted as
+`k` — which is comparable across solvers and is the honest way to price one against
+another. `Diagnostics::detail` carries per-algorithm figures such as `irlba`'s restart
+count and converged flag.
 
-## Diagnostics
+## Migrating from 1.x
 
-Each SVD computation returns detailed diagnostics:
+2.0 is a clean break.
 
-```rust
-let svd = laczos::svd(&matrix)?;
-println!("Non-zero elements: {}", svd.diagnostics.non_zero);
-println!("Transposed during computation: {}", svd.diagnostics.transposed);
-println!("Lanczos steps: {}", svd.diagnostics.lanczos_steps);
-println!("Significant values found: {}", svd.diagnostics.significant_values);
-```
+| 1.x | 2.0 |
+|---|---|
+| `nalgebra_sparse::CsrMatrix<f64>` | `SvdMat<f64>` (`sprs::CsMatI<f64, u32, u64>`) |
+| `lanczos::svd_dim_seed(&m, k, seed)` | `single_svdlib::svd_seed(&m, k, seed)` |
+| `randomized::randomized_svd(&m, k, o, q, norm, center, seed, verbose)` | `randomized::svd_with(&m, &RandomizedConfig::new(k)…, progress)` |
+| `MaskedCSRMatrix` | `MaskedCsMat` |
+| `SMat` trait | `SparseMat` + `SparseMatDense` |
+| `anyhow::Result` from `randomized` | `single_svdlib::Result` everywhere |
+| `svd.u` orientation varied by solver | always `m × d` |
 
-## Performance Tips
+Behavioural changes worth knowing about:
 
-1. **Choose the right algorithm**:
-    - For matrices up to ~10,000 x 10,000 with moderate sparsity, use the Lanczos algorithm
-    - For larger matrices or very high sparsity (>99%), use randomized SVD
+- **`u` orientation is now consistent.** 1.x returned `u` as `d × m` from the Lanczos
+  path but `m × d` from the randomized path, so `recompose()` only worked on square
+  inputs. Both are now `m × d`.
+- **Singular values are always descending.**
+- **`randomized` actually works.** In 1.x, four of `SMat`'s five methods were `todo!()`
+  in every built-in implementation, so `randomized_svd` panicked for `CsrMatrix`,
+  `CscMatrix` and `CooMatrix` alike — every documented usage. Nine of the crate's
+  seventeen tests failed.
+- **Mean centering is fixed.** 1.x computed `(Σⱼ mⱼ)·(Σᵢ D[i,c])` where the correction is
+  `Σⱼ mⱼ·D[j,c]` — the product of the sums instead of the sum of the products.
+- **An unseeded randomized run is now actually random.** 1.x mapped `seed: None` to
+  seed `0`, so every "random" sketch was identical.
+- **Masked matrices no longer mis-dispatch.** 1.x delegated to the *unmasked* matrix for
+  any small input regardless of the mask, feeding a masked-width vector to a full-width
+  product.
 
-2. **Matrix format matters**:
-    - Convert COO matrices to CSR or CSC for computation
-    - CSR typically performs better for row-oriented operations
+### LAS2 is deprecated
 
-3. **Adjust parameters for very sparse matrices**:
-    - Increase power iterations in randomized SVD (e.g., 5-7)
-    - Use a higher `kappa` value in Lanczos for very sparse matrices
+The `lanczos` module is retained so 2.0 does not silently drop the API, but it is
+`#[deprecated]` and **should not be used**. Checked against a dense LAPACK reference, it
+returns the largest singular value with 18%–100% relative error on every matrix class
+tested — including `diag(n, n-1, …, 1)`, where asking for the full rank still reports
+`32` when the answer is `40`.
 
-4. **Consider column masking** for operations that only need a subset of the data
+This is inherited from published 1.x, not introduced by the sprs port; running
+`single-svdlib 1.0.9` from crates.io on identical fixtures reproduces the same wrong
+values. Two causes are known:
 
-## License
+1. **Fixed.** `imtqlb` hoisted its shift origin `p = d[l]` out of the iteration loop,
+   where EISPACK `IMTQL1` assigns it *inside* (label 120), so every eigenvalue after the
+   first was computed from a stale shift. This is the source of the
+   `imtqlb had some convergence issues` warnings 1.x printed on nearly every input before
+   continuing with corrupted Ritz values.
+2. **Open.** `ritvec` reads `s[k*js + i]` — row `k` — while `imtql2` stores eigenvectors
+   as columns. Transposing roughly halves the residual error but does not close it, so at
+   least one further defect remains.
 
-This crate is licensed under the BSD License, the same as the original SVDLIBC implementation. See the `SVDLIBC-LICENSE.txt` file for details.
+Use `irlba` instead. It is validated against LAPACK to 1e-10 on the same fixtures,
+including the diagonal case, and its memory is bounded.
+
+Run `cargo test --release -- --ignored lanczos::tests::report_accuracy_vs_lapack` to see
+the current error profile.
+
+## Licence
+
+BSD, as the original SVDLIBC. See `SVDLIBC-LICENSE.txt`.
 
 ## Credits
 
-- Original SVDLIBC implementation by Doug Rohde
-- Rust port maintainer of SVDLIBC: Dave Farnham
-- Extensions and modifications of the original algorithm: Ian F. Diks
+- Original SVDLIBC by Doug Rohde
+- Rust port of SVDLIBC by Dave Farnham
+- Extensions and modifications by Ian F. Diks

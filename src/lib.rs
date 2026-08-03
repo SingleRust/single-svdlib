@@ -1,281 +1,190 @@
-pub mod legacy;
+//! Sparse singular value decomposition.
+//!
+//! Three solvers over [`sprs`] matrices, all returning the same [`SvdRec`]:
+//!
+//! | module | method | use when |
+//! |---|---|---|
+//! | [`irlba`] | thick-restarted Lanczos bidiagonalization | **default.** Accurate, memory bounded by the requested rank |
+//! | [`randomized`] | randomized range finder, power iteration or block Krylov | very large inputs where an approximation is acceptable |
+//! | [`lanczos`] | LAS2 from SVDLIBC | **deprecated, numerically unreliable** — see the module docs |
+//!
+//! # Quick start
+//!
+//! ```
+//! use single_svdlib::{sprs::TriMatI, SvdMat};
+//!
+//! // A 4x3 matrix in triplet form, converted to CSR with u32 indices.
+//! let mut tri = TriMatI::<f64, u32>::new((4, 3));
+//! tri.add_triplet(0, 0, 1.0);
+//! tri.add_triplet(1, 1, 2.0);
+//! tri.add_triplet(2, 2, 3.0);
+//! tri.add_triplet(3, 0, 4.0);
+//! let a: SvdMat<f64> = tri.to_csr::<u64>();
+//!
+//! // Two largest singular triplets.
+//! let svd = single_svdlib::svd(&a, 2)?;
+//!
+//! assert_eq!(svd.s.len(), 2);
+//! assert_eq!(svd.u.dim(), (4, 2));   // left vectors are columns
+//! assert_eq!(svd.vt.dim(), (2, 3));  // right vectors are rows
+//! assert!(svd.s[0] >= svd.s[1]);
+//! # Ok::<(), single_svdlib::SvdLibError>(())
+//! ```
+//!
+//! # Index widths
+//!
+//! [`SvdMat<T>`] defaults to `u32` column indices with `u64` row pointers, which is
+//! 12 bytes per non-zero for `f64` data against the 16 that `usize`-everywhere costs
+//! (8 against 16 for `f32`). Name the parameters to widen: `SvdMat<f64, u64, u64>`.
+//!
+//! # Orientation
+//!
+//! `A ≈ u · diag(s) · vt`, matching `numpy.linalg.svd`: `u` is `m × d` with left
+//! vectors as columns, `s` is descending, `vt` is `d × n` with right vectors as rows.
+//! 1.x was inconsistent between solvers on this point.
+
+// Numeric kernels index several arrays in step from one loop variable, and
+// offset arithmetic is load-bearing; iterator rewrites obscure which array an
+// index belongs to.
+#![allow(clippy::needless_range_loop)]
+
+pub mod dense;
 pub mod error;
-pub(crate) mod utils;
-
-pub mod randomized;
-
+pub mod irlba;
 pub mod lanczos;
-
-pub use utils::*;
-
+pub mod matrix;
+pub mod randomized;
+pub mod types;
 
 #[cfg(test)]
-mod simple_comparison_tests {
+mod testing;
+
+pub use error::{Result, SvdLibError};
+pub use matrix::{
+    MaskedCsMat, SparseMat, SparseMatDense, SvdMat, SvdMatView, DEFAULT_SCRATCH_BUDGET,
+};
+pub use types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
+
+/// Re-exported so callers construct matrices without pinning `sprs` themselves.
+pub use sprs;
+
+/// The `rank` largest singular triplets.
+///
+/// Dispatches to [`irlba`], which is accurate and holds a basis bounded by `rank`.
+/// Reach past this for a fixed seed ([`irlba::svd_seed`]), PCA
+/// ([`irlba::svd_centered`]), or an approximation on a very large input
+/// ([`randomized`]).
+pub fn svd<T: SvdFloat, M: SparseMat<T>>(a: &M, rank: usize) -> Result<SvdRec<T>> {
+    irlba::svd(a, rank)
+}
+
+/// The `rank` largest singular triplets, reproducibly.
+pub fn svd_seed<T: SvdFloat, M: SparseMat<T>>(a: &M, rank: usize, seed: u64) -> Result<SvdRec<T>> {
+    irlba::svd_seed(a, rank, seed)
+}
+
+/// PCA: the `rank` largest singular triplets of the implicitly mean-centered matrix.
+///
+/// The centering is applied as a rank-1 correction inside each product, so the matrix
+/// is never densified.
+pub fn svd_centered<T: SvdFloat, M: SparseMatDense<T>>(
+    a: &M,
+    rank: usize,
+    seed: Option<u64>,
+) -> Result<SvdRec<T>> {
+    irlba::svd_centered(a, rank, seed)
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
-    use legacy;
-    use nalgebra_sparse::coo::CooMatrix;
-    use nalgebra_sparse::CsrMatrix;
-    use rand::{Rng, SeedableRng};
-    use rand::rngs::StdRng;
-    use rayon::ThreadPoolBuilder;
+    use crate::testing::{dense_of, gen_lowrank, gen_sparse, reference_singular_values};
 
-    fn create_sparse_matrix(rows: usize, cols: usize, density: f64) -> nalgebra_sparse::coo::CooMatrix<f64> {
-        use rand::{rngs::StdRng, Rng, SeedableRng};
-        use std::collections::HashSet;
+    /// Every solver must agree with a dense LAPACK reference on the same matrix, to
+    /// each one's own accuracy class. This is the cross-algorithm contract.
+    #[test]
+    fn all_solvers_agree_with_lapack() {
+        let a = gen_lowrank(300, 100, 10, 101);
+        let want = reference_singular_values(&dense_of(&a));
+        let rank = 10;
 
-        let mut coo = nalgebra_sparse::coo::CooMatrix::new(rows, cols);
+        let by_irlba = irlba::svd_seed(&a, rank, 42).unwrap();
+        let by_random = randomized::svd_with(
+            &a,
+            &randomized::RandomizedConfig::new(rank)
+                .seed(42)
+                .power_iterations(4),
+            None,
+        )
+        .unwrap();
+        let by_default = svd_seed(&a, rank, 42).unwrap();
 
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let nnz = (rows as f64 * cols as f64 * density).round() as usize;
-
-        let nnz = nnz.max(1);
-
-        let mut positions = HashSet::new();
-
-        while positions.len() < nnz {
-            let i = rng.gen_range(0..rows);
-            let j = rng.gen_range(0..cols);
-
-            if positions.insert((i, j)) {
-                let val = loop {
-                    let v: f64 = rng.gen_range(-10.0..10.0);
-                    if v.abs() > 1e-10 { // Ensure it's not too close to zero
-                        break v;
-                    }
-                };
-
-                coo.push(i, j, val);
-            }
-        }
-
-        // Verify the density is as expected
-        let actual_density = coo.nnz() as f64 / (rows as f64 * cols as f64);
-        println!("Created sparse matrix: {} x {}", rows, cols);
-        println!("  - Requested density: {:.6}", density);
-        println!("  - Actual density: {:.6}", actual_density);
-        println!("  - Sparsity: {:.4}%", (1.0 - actual_density) * 100.0);
-        println!("  - Non-zeros: {}", coo.nnz());
-
-        coo
-    }
-    //#[test]
-    fn simple_matrix_comparison() {
-        // Create a small, predefined test matrix
-        let mut test_matrix = CooMatrix::<f64>::new(3, 3);
-        test_matrix.push(0, 0, 1.0);
-        test_matrix.push(0, 1, 16.0);
-        test_matrix.push(0, 2, 49.0);
-        test_matrix.push(1, 0, 4.0);
-        test_matrix.push(1, 1, 25.0);
-        test_matrix.push(1, 2, 64.0);
-        test_matrix.push(2, 0, 9.0);
-        test_matrix.push(2, 1, 36.0);
-        test_matrix.push(2, 2, 81.0);
-
-        // Run both implementations with the same seed for deterministic behavior
-        let seed = 42;
-        let current_result = lanczos::svd_dim_seed(&test_matrix, 0, seed).unwrap();
-        let legacy_result = legacy::svd_dim_seed(&test_matrix, 0, seed).unwrap();
-
-        // Compare dimensions
-        assert_eq!(current_result.d, legacy_result.d);
-
-        // Compare singular values
-        let epsilon = 1.0e-12;
-        for i in 0..current_result.d {
-            let diff = (current_result.s[i] - legacy_result.s[i]).abs();
-            assert!(
-                diff < epsilon,
-                "Singular value {} differs by {}: current = {}, legacy = {}",
-                i, diff, current_result.s[i], legacy_result.s[i]
-            );
-        }
-
-        // Compare reconstructed matrices
-        let current_reconstructed = current_result.recompose();
-        let legacy_reconstructed = legacy_result.recompose();
-
-        for i in 0..3 {
-            for j in 0..3 {
-                let diff = (current_reconstructed[[i, j]] - legacy_reconstructed[[i, j]]).abs();
+        for i in 0..rank {
+            for (name, got, tol) in [
+                ("irlba", by_irlba.s[i], 1e-9),
+                ("randomized", by_random.s[i], 1e-6),
+                ("top-level default", by_default.s[i], 1e-9),
+            ] {
+                let rel = (got - want[i]).abs() / want[i];
                 assert!(
-                    diff < epsilon,
-                    "Reconstructed matrix element [{},{}] differs by {}: current = {}, legacy = {}",
-                    i, j, diff, current_reconstructed[[i, j]], legacy_reconstructed[[i, j]]
+                    rel < tol,
+                    "{name} triplet {i}: {got:.12e} vs LAPACK {:.12e} (rel {rel:.3e})",
+                    want[i]
                 );
             }
         }
     }
 
+    /// The top-level entry point must be IRLBA, as documented.
     #[test]
-    fn random_matrix_comparison() {
-        let seed = 12345;
-        let (nrows, ncols) = (50, 30);
-        let mut rng = StdRng::seed_from_u64(seed);
+    fn top_level_dispatches_to_irlba() {
+        let a = gen_sparse(120, 60, 0.1, 7);
+        let got = svd(&a, 5).unwrap();
+        assert_eq!(got.diagnostics.algorithm, Algorithm::Irlba);
+    }
 
-        // Create random sparse matrix
-        let mut coo = CooMatrix::<f64>::new(nrows, ncols);
-        // Insert some random non-zero elements
-        for _ in 0..(nrows * ncols / 5) {  // ~20% density
-            let i = rng.gen_range(0..nrows);
-            let j = rng.gen_range(0..ncols);
-            let value = rng.gen_range(-10.0..10.0);
-            coo.push(i, j, value);
+    /// `u32`-indexed and `u64`-indexed matrices must give identical answers — the
+    /// memory win must not cost accuracy.
+    #[test]
+    fn index_width_does_not_change_results() {
+        use sprs::TriMatI;
+        let a32 = gen_sparse(200, 80, 0.08, 13);
+
+        let mut t = TriMatI::<f64, u64>::new((200, 80));
+        for (v, (i, j)) in a32.iter() {
+            t.add_triplet(i as usize, j as usize, *v);
         }
+        let a64: SvdMat<f64, u64, u64> = t.to_csr::<u64>();
 
-        let csr = CsrMatrix::from(&coo);
-
-        // Calculate SVD using original method
-        let legacy_svd = lanczos::svd_dim_seed(&csr, 0, seed as u32).unwrap();
-
-        // Calculate SVD using our masked method (using all columns)
-        let mask = vec![true; ncols];
-        let masked_matrix = lanczos::masked::MaskedCSRMatrix::new(&csr, mask);
-        let current_svd = lanczos::svd_dim_seed(&masked_matrix, 0, seed as u32).unwrap();
-
-        // Compare with relative tolerance
-        let rel_tol = 1e-3;  // 0.1% relative tolerance
-
-        assert_eq!(legacy_svd.d, current_svd.d, "Ranks differ");
-
-        for i in 0..legacy_svd.d {
-            let legacy_val = legacy_svd.s[i];
-            let current_val = current_svd.s[i];
-            let abs_diff = (legacy_val - current_val).abs();
-            let rel_diff = abs_diff / legacy_val.max(current_val);
-
-            assert!(
-                rel_diff <= rel_tol,
-                "Singular value {} differs too much: relative diff = {}, current = {}, legacy = {}",
-                i, rel_diff, current_val, legacy_val
-            );
+        let x = svd_seed(&a32, 10, 42).unwrap();
+        let y = svd_seed(&a64, 10, 42).unwrap();
+        for (p, q) in x.s.iter().zip(y.s.iter()) {
+            approx::assert_relative_eq!(p, q, max_relative = 1e-12);
         }
     }
 
+    /// The documented memory claim, checked against the buffers sprs actually holds.
     #[test]
-    fn test_real_sparse_matrix() {
-        // Create a matrix with similar sparsity to your real one (99.02%)
-        let test_matrix = create_sparse_matrix(100, 100, 0.0098); // 0.98% non-zeros
-        
-        // Should no longer fail with convergence error
-        let result = lanczos::svd_dim_seed(&test_matrix, 50, 42);
-        assert!(result.is_ok(), "{}", format!("SVD failed on 99.02% sparse matrix, {:?}", result.err().unwrap()));
-    }
+    fn u32_indices_are_smaller_than_usize_indices() {
+        let a = gen_sparse(2000, 500, 0.02, 3);
+        let nnz = a.nnz();
+        let rows = a.rows();
 
-    #[test]
-    fn test_random_svd_computation() {
+        assert_eq!(a.indices().len(), nnz);
+        assert_eq!(a.data().len(), nnz);
 
-        let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
+        let ours = (rows + 1) * std::mem::size_of::<u64>()
+            + nnz * std::mem::size_of::<u32>()
+            + nnz * std::mem::size_of::<f64>();
+        let usize_everywhere = (rows + 1) * std::mem::size_of::<usize>()
+            + nnz * std::mem::size_of::<usize>()
+            + nnz * std::mem::size_of::<f64>();
 
-        let csr = CsrMatrix::from(&test_matrix);
-
-        let result = randomized::randomized_svd(
-            &csr,
-            50,
-            10,
-            3,
-            randomized::PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            false
-        );
-
-        // Verify the computation succeeds on a highly sparse matrix
+        let saving = 1.0 - (ours as f64 / usize_everywhere as f64);
         assert!(
-            result.is_ok(),
-            "Randomized SVD failed on 99% sparse matrix: {:?}",
-            result.err().unwrap()
-        );
-
-        // Additional checks on the result if successful
-        if let Ok(svd_result) = result {
-            // Verify dimensions match expectations
-            assert_eq!(svd_result.d, 50, "Expected rank of 50");
-
-            // Verify singular values are positive and in descending order
-            for i in 0..svd_result.s.len() {
-                assert!(svd_result.s[i] > 0.0, "Singular values should be positive");
-                if i > 0 {
-                    assert!(
-                        svd_result.s[i-1] >= svd_result.s[i],
-                        "Singular values should be in descending order"
-                    );
-                }
-            }
-
-            // Verify basics of U and V dimensions
-            assert_eq!(svd_result.u.nrows(), 50, "U transpose should have 50 rows");
-            assert_eq!(svd_result.u.ncols(), 1000, "U transpose should have 1000 columns");
-            assert_eq!(svd_result.vt.nrows(), 50, "V transpose should have 50 rows");
-            assert_eq!(svd_result.vt.ncols(), 250, "V transpose should have 250 columns");
-
-        }
-    }
-
-    #[test]
-    fn test_randomized_svd_very_large_sparse_matrix() {
-
-        // Create a very large matrix with high sparsity (99%)
-        let test_matrix = create_sparse_matrix(100000, 2500, 0.01); // 1% non-zeros
-
-        // Convert to CSR for processing
-        let csr = CsrMatrix::from(&test_matrix);
-    
-        // Run randomized SVD with reasonable defaults for a sparse matrix
-        let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
-        let result = threadpool.install(|| {
-            randomized::randomized_svd(
-                &csr,
-                50,                              // target rank
-                10,                              // oversampling parameter
-                7,                               // power iterations
-                randomized::PowerIterationNormalizer::QR,    // use QR normalization
-                false,
-                Some(42),
-                false// random seed
-            )
-        });
-
-
-        // Simply verify that the computation succeeds on a highly sparse matrix
-        assert!(
-            result.is_ok(),
-            "Randomized SVD failed on 99% sparse matrix: {:?}",
-            result.err().unwrap()
-        );
-    }
-
-    #[test]
-    fn test_randomized_svd_small_sparse_matrix() {
-
-        // Create a very large matrix with high sparsity (99%)
-        let test_matrix = create_sparse_matrix(1000, 250, 0.01); // 1% non-zeros
-
-        // Convert to CSR for processing
-        let csr = CsrMatrix::from(&test_matrix);
-
-        // Run randomized SVD with reasonable defaults for a sparse matrix
-        let threadpool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
-        let result = threadpool.install(|| {
-            randomized::randomized_svd(
-                &csr,
-                50,                              // target rank
-                10,                              // oversampling parameter
-                2,                               // power iterations
-                randomized::PowerIterationNormalizer::QR,    // use QR normalization
-                false,
-                Some(42),                        // random seed
-                false
-            )
-        });
-
-
-        // Simply verify that the computation succeeds on a highly sparse matrix
-        assert!(
-            result.is_ok(),
-            "Randomized SVD failed on 99% sparse matrix: {:?}",
-            result.err().unwrap()
+            saving > 0.2,
+            "expected >20% smaller, got {:.1}%",
+            saving * 100.0
         );
     }
 }

@@ -1,24 +1,37 @@
 [package]
 authors = ["Dave Farnham <dave.farnham@icloud.com>", "Ian F. Diks <ian.diks@uni-saarland.de>"]
-description = "A Rust port of LAS2 from SVDLIBC"
-keywords = ["svd"]
-categories = ["algorithms", "data-structures", "mathematics", "science"]
+description = "Sparse SVD and PCA for Rust over sprs matrices: restarted Lanczos bidiagonalization (IRLBA) and randomized SVD, with column masking and mean-centering that never densify the input"
+keywords = ["svd", "sparse", "lanczos", "randomized", "irlba"]
+categories = ["algorithms", "mathematics", "science"]
 name = "single-svdlib"
-version = "1.0.9"
+version = "2.0.0"
 edition = "2021"
+rust-version = "1.88"
 license-file = "SVDLIBC-LICENSE.txt"
+repository = "https://github.com/SingleRust/single-svdlib"
 
-[features]
-# simd = ["dep:simba", "single-utilities/simd"]
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-anyhow = "1.0"
-nalgebra-sparse = "0.11.0"
+# `default-features = false` drops sprs's `alga` feature (unmaintained since 2019).
+# We also skip its `multi_thread` feature: that only parallelises sparse-sparse
+# products, which this crate never performs, and we drive rayon ourselves.
+sprs = { version = "0.11.5", default-features = false }
+ndarray = { version = "0.16", features = ["rayon"] }
 num-traits = "0.2.19"
-rand = "0.9.0"
-rand_distr = "0.5.1"
-rayon = "1.10.0"
-thiserror = "2.0.9"
-ndarray = "0.16"
-single-utilities = { version = "0.9.0", features = ["convert"] }
-nalgebra = { version = "0.34", features = ["rayon"] }
+rand = "0.9"
+rand_distr = "0.5"
+rayon = "1.10"
+thiserror = "2.0"
+single-utilities = "0.9.0"
+
+[dev-dependencies]
+approx = "0.5"
+# Test-only: an independent reference factorization to check our own against.
+nalgebra = "0.34"
+proptest = "1"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
