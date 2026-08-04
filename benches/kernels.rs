@@ -17,7 +17,7 @@ use single_svdlib::{dense, MaskedCsMat, SparseMat, SparseMatDense};
 use std::hint::black_box;
 
 fn sparse_products(c: &mut Criterion) {
-    let a = common::counts(60_000, 4_000, 120, 16, 7);
+    let a = common::counts(25_000, 2_500, 100, 16, 7);
     let (rows, cols, nnz) = (a.rows(), a.cols(), a.nnz());
 
     let mut group = c.benchmark_group("sparse_product");
@@ -57,7 +57,7 @@ fn sparse_products(c: &mut Criterion) {
 /// A view costs a lookup per non-zero; an extraction costs one copy. Which wins depends
 /// on how many products follow, so time both.
 fn masked_view(c: &mut Criterion) {
-    let a = common::counts(60_000, 4_000, 120, 16, 7);
+    let a = common::counts(25_000, 2_500, 100, 16, 7);
     let selected = common::every_nth(a.cols(), 8);
     let view = MaskedCsMat::with_columns(&a, &selected);
     let extracted = view.to_sparse();
@@ -79,7 +79,7 @@ fn masked_view(c: &mut Criterion) {
 /// The explained-variance denominator. The centered form also walks the column means,
 /// so it is measurably more work than the plain one.
 fn norms(c: &mut Criterion) {
-    let a = common::counts(60_000, 4_000, 120, 16, 7);
+    let a = common::counts(25_000, 2_500, 100, 16, 7);
     let means = a.col_means();
 
     let mut group = c.benchmark_group("norm");

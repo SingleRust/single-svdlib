@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// Big enough for the parallel paths to engage, small enough to finish in minutes.
 fn fixture() -> single_svdlib::SvdMat<f64> {
-    common::counts(40_000, 3_000, 100, 16, 7)
+    common::counts(15_000, 1_500, 80, 16, 7)
 }
 
 fn irlba_ranks(c: &mut Criterion) {
@@ -26,7 +26,7 @@ fn irlba_ranks(c: &mut Criterion) {
         .sample_size(10)
         .measurement_time(Duration::from_secs(20));
 
-    for rank in [10usize, 30, 50] {
+    for rank in [10usize, 30] {
         group.bench_with_input(BenchmarkId::new("plain", rank), &rank, |b, &rank| {
             b.iter(|| black_box(irlba::svd_seed(&a, rank, 42).unwrap()))
         });
@@ -41,7 +41,7 @@ fn irlba_ranks(c: &mut Criterion) {
 /// but needs far fewer of them. Worth 2.2x at 400k x 30k.
 fn irlba_work(c: &mut Criterion) {
     let a = fixture();
-    let rank = 50usize;
+    let rank = 30usize;
     let means = a.col_means();
 
     let mut group = c.benchmark_group("irlba_work");
@@ -70,7 +70,7 @@ fn irlba_work(c: &mut Criterion) {
 
 fn randomized_sketches(c: &mut Criterion) {
     let a = fixture();
-    let rank = 50usize;
+    let rank = 30usize;
 
     let mut group = c.benchmark_group("randomized");
     group
@@ -104,7 +104,7 @@ fn masked_pca(c: &mut Criterion) {
     let selected = common::every_nth(a.cols(), 6);
     let view = MaskedCsMat::with_columns(&a, &selected);
     let extracted = view.to_sparse();
-    let rank = 30usize;
+    let rank = 20usize;
 
     let mut group = c.benchmark_group("masked_pca");
     group

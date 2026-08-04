@@ -16,17 +16,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # `--all-targets` covers the unit tests, the integration suites under
-      # `tests/` (cross-algorithm, robustness, and the proptest properties), and
-      # compiles the examples and benches. It does not run doctests, hence the
-      # second step.
+      # Not `--all-targets`: that pulls in the bench targets, and criterion's
+      # smoke-run of them in a debug build takes minutes.
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --lib --tests --examples
       # `las2` is off by default, so the default run never compiles that module.
       - name: Test (all features)
-        run: cargo test --all-features --all-targets
+        run: cargo test --all-features --lib --tests --examples
       - name: Doctests
         run: cargo test --all-features --doc
+      - name: Build benches
+        run: cargo build --all-features --benches
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Format
