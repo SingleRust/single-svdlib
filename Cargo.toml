@@ -1,24 +1,49 @@
 [package]
 authors = ["Dave Farnham <dave.farnham@icloud.com>", "Ian F. Diks <ian.diks@uni-saarland.de>"]
-description = "A Rust port of LAS2 from SVDLIBC"
-keywords = ["svd"]
-categories = ["algorithms", "data-structures", "mathematics", "science"]
+description = "Sparse SVD and PCA for Rust over sprs matrices: restarted Lanczos bidiagonalization (IRLBA) and randomized SVD, with column masking and mean-centering that never densify the input"
+keywords = ["svd", "sparse", "lanczos", "randomized", "irlba"]
+categories = ["algorithms", "mathematics", "science"]
 name = "single-svdlib"
-version = "1.0.9"
+version = "2.0.0"
 edition = "2021"
-license-file = "SVDLIBC-LICENSE.txt"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+repository = "https://github.com/SingleRust/single-svdlib"
+homepage = "https://github.com/SingleRust/single-svdlib"
+documentation = "https://docs.rs/single-svdlib"
+readme = "README.md"
+exclude = [".vscode", ".github", "GEMINI.md"]
 
 [features]
-# simd = ["dep:simba", "single-utilities/simd"]
+las2 = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-anyhow = "1.0"
-nalgebra-sparse = "0.11.0"
+sprs = { version = "0.11.5", default-features = false }
+ndarray = { version = "0.17.2", features = ["rayon"] }
 num-traits = "0.2.19"
-rand = "0.9.0"
-rand_distr = "0.5.1"
-rayon = "1.10.0"
-thiserror = "2.0.9"
-ndarray = "0.16"
-single-utilities = { version = "0.9.0", features = ["convert"] }
-nalgebra = { version = "0.34", features = ["rayon"] }
+rand = "0.10.2"
+rand_distr = "0.6"
+rayon = "1.12"
+thiserror = "2.0.19"
+single-utilities = "0.9.0"
+
+[dev-dependencies]
+approx = "0.5"
+criterion = "0.8"
+nalgebra = "0.35"
+proptest = "1"
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "solvers"
+harness = false
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

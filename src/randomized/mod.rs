@@ -1,778 +1,777 @@
-use crate::error::SvdLibError;
-use crate::{Diagnostics, SMat, SvdFloat, SvdRec};
-use nalgebra_sparse::na::{ComplexField, DMatrix, DVector, RealField};
-use ndarray::Array1;
-use rand::prelude::{Distribution, StdRng};
-use rand::SeedableRng;
-use rand_distr::Normal;
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
-use std::ops::Mul;
-use std::time::Instant;
-use single_utilities::traits::IntoNdarray2;
+//! Randomized SVD: range finding by random projection.
+//!
+//! Two sketching strategies, both built on the same reduction:
+//!
+//! - [`Sketch::PowerIteration`] — Halko, Martinsson & Tropp. Cheap and accurate when
+//!   the spectrum decays quickly.
+//! - [`Sketch::BlockKrylov`] — Musco & Musco. Keeps every power-iteration block instead
+//!   of only the last, which is markedly more accurate on slowly-decaying spectra at
+//!   the cost of a wider basis.
+//!
+//! # The final factorization is `l × l`, not `l × cols`
+//!
+//! Once a range basis `Y` (`rows × l`) is in hand, the naive next step is to form
+//! `B = Yᵀ·A` (`l × cols`) and take its dense SVD. `cols` can be large, so 1.x's
+//! `b.svd(true, true)` was a dense factorization of a potentially huge matrix.
+//!
+//! Instead note that `Bᵀ = Aᵀ·Y` is itself tall and skinny (`cols × l`). Factor it with
+//! [`tsqr`](crate::dense::tsqr()) as `Bᵀ = Q_c·R_c`, then the only dense SVD needed is of
+//! `R_cᵀ`, which is `l × l`:
+//!
+//! ```text
+//! A ≈ Y·Bᵀᵀ = Y·R_cᵀ·Q_cᵀ = (Y·Û)·Ŝ·(Q_c·V̂)ᵀ
+//! ```
+//!
+//! With rank 50 and 10 oversamples that is a 60 × 60 factorization regardless of how
+//! wide the input is.
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PowerIterationNormalizer {
-    QR,
-    LU,
+use crate::dense::{small_svd, svd_flip, tsqr};
+use crate::error::{Result, SvdLibError};
+use crate::matrix::SparseMatDense;
+use crate::types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
+use ndarray::{s, Array1, Array2, Axis};
+use rand::rngs::StdRng;
+use rand::{rng, Rng, SeedableRng};
+use rand_distr::{Distribution, Normal};
+
+/// Default oversampling beyond the requested rank.
+pub const DEFAULT_OVERSAMPLES: usize = 10;
+/// Default power iterations.
+pub const DEFAULT_POWER_ITERATIONS: usize = 2;
+
+/// How the intermediate basis is re-orthogonalised between products.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Normalizer {
+    /// Tall-skinny QR. Numerically the right default.
+    #[default]
+    Tsqr,
+    /// Column normalisation only. Cheaper, and adequate for one or two iterations, but
+    /// it does not prevent the basis collapsing toward the dominant direction.
+    ColumnNorm,
+    /// No re-orthogonalisation. Only safe with zero power iterations.
     None,
 }
 
-const PARALLEL_THRESHOLD_ROWS: usize = 5000;
-const PARALLEL_THRESHOLD_COLS: usize = 1000;
+/// The sketching strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sketch {
+    /// `Y = (A·Aᵀ)^q·A·Ω`, keeping only the final block.
+    ///
+    /// Basis width is `rank + oversamples`.
+    PowerIteration { iterations: usize },
+    /// `K = [A·Ω, (A·Aᵀ)A·Ω, …, (A·Aᵀ)^(b-1)·A·Ω]`, keeping every block.
+    ///
+    /// Basis width is `blocks · (rank + oversamples)`, so memory scales with `blocks`.
+    /// Two to four blocks is usually the sweet spot.
+    BlockKrylov { blocks: usize },
+}
 
-pub fn randomized_svd<T, M>(
-    m: &M,
-    target_rank: usize,
-    n_oversamples: usize,
-    n_power_iters: usize,
-    power_iteration_normalizer: PowerIterationNormalizer,
-    mean_center: bool,
-    seed: Option<u64>,
-    verbose: bool,
-) -> anyhow::Result<SvdRec<T>>
-where
-    T: SvdFloat + RealField,
-    M: SMat<T> + std::marker::Sync,
-    T: ComplexField,
-{
-    let start = Instant::now();
-    let m_rows = m.nrows();
-    let m_cols = m.ncols();
-
-    let rank = target_rank.min(m_rows.min(m_cols));
-    let l = rank + n_oversamples;
-
-    let column_means: Option<DVector<T>> = if mean_center {
-        if verbose {
-            println!("SVD | Randomized | Computing column means....");
+impl Default for Sketch {
+    fn default() -> Self {
+        Sketch::PowerIteration {
+            iterations: DEFAULT_POWER_ITERATIONS,
         }
-        Some(DVector::from(m.compute_column_means()))
+    }
+}
+
+/// Configuration for [`svd_with`].
+///
+/// Replaces 1.x's eight positional arguments, two of which were bare `bool`s that the
+/// crate's own call sites commented incorrectly.
+#[derive(Debug, Clone)]
+pub struct RandomizedConfig {
+    /// Number of singular triplets wanted.
+    pub rank: usize,
+    /// Extra sketch columns; improves accuracy at linear cost.
+    pub oversamples: usize,
+    pub sketch: Sketch,
+    pub normalizer: Normalizer,
+    /// Subtract column means without materialising the centered matrix.
+    pub mean_center: bool,
+    /// Fixed seed; `None` draws from the OS.
+    ///
+    /// 1.x accepted `Option<u64>` but substituted `0` for `None`, so "random" was in
+    /// fact a fixed sketch on every call.
+    pub seed: Option<u64>,
+}
+
+impl RandomizedConfig {
+    pub fn new(rank: usize) -> Self {
+        Self {
+            rank,
+            oversamples: DEFAULT_OVERSAMPLES,
+            sketch: Sketch::default(),
+            normalizer: Normalizer::default(),
+            mean_center: false,
+            seed: None,
+        }
+    }
+    pub fn oversamples(mut self, n: usize) -> Self {
+        self.oversamples = n;
+        self
+    }
+    pub fn power_iterations(mut self, n: usize) -> Self {
+        self.sketch = Sketch::PowerIteration { iterations: n };
+        self
+    }
+    pub fn block_krylov(mut self, blocks: usize) -> Self {
+        self.sketch = Sketch::BlockKrylov { blocks };
+        self
+    }
+    pub fn normalizer(mut self, n: Normalizer) -> Self {
+        self.normalizer = n;
+        self
+    }
+    pub fn mean_center(mut self, yes: bool) -> Self {
+        self.mean_center = yes;
+        self
+    }
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+}
+
+/// A sink for progress messages, called once per major stage.
+///
+/// 1.x printed stage timings to stdout behind a `verbose: bool`. A library shouldn't
+/// write to the process's streams, so the caller supplies the sink.
+pub type Progress<'a> = &'a (dyn Fn(&str) + Sync);
+
+/// `rank` largest singular triplets with default settings.
+pub fn svd<T: SvdFloat, M: SparseMatDense<T>>(a: &M, rank: usize) -> Result<SvdRec<T>> {
+    svd_with(a, &RandomizedConfig::new(rank), None)
+}
+
+/// `rank` largest singular triplets with a fixed seed.
+pub fn svd_seed<T: SvdFloat, M: SparseMatDense<T>>(
+    a: &M,
+    rank: usize,
+    seed: u64,
+) -> Result<SvdRec<T>> {
+    svd_with(a, &RandomizedConfig::new(rank).seed(seed), None)
+}
+
+/// Block-Krylov variant with `blocks` blocks.
+pub fn svd_block_krylov<T: SvdFloat, M: SparseMatDense<T>>(
+    a: &M,
+    rank: usize,
+    blocks: usize,
+    seed: Option<u64>,
+) -> Result<SvdRec<T>> {
+    let mut cfg = RandomizedConfig::new(rank).block_krylov(blocks);
+    cfg.seed = seed;
+    svd_with(a, &cfg, None)
+}
+
+/// PCA: `rank` largest triplets of the implicitly mean-centered matrix.
+pub fn svd_centered<T: SvdFloat, M: SparseMatDense<T>>(
+    a: &M,
+    rank: usize,
+    seed: Option<u64>,
+) -> Result<SvdRec<T>> {
+    let mut cfg = RandomizedConfig::new(rank).mean_center(true);
+    cfg.seed = seed;
+    svd_with(a, &cfg, None)
+}
+
+/// Compute a decomposition with explicit configuration.
+pub fn svd_with<T: SvdFloat, M: SparseMatDense<T>>(
+    a: &M,
+    cfg: &RandomizedConfig,
+    progress: Option<Progress<'_>>,
+) -> Result<SvdRec<T>> {
+    let note = |msg: &str| {
+        if let Some(p) = progress {
+            p(msg);
+        }
+    };
+
+    let (rows, cols) = (a.rows(), a.cols());
+    let min_dim = rows.min(cols);
+    if cfg.rank == 0 {
+        return Err(SvdLibError::invalid("randomized: rank must be at least 1"));
+    }
+    if cfg.rank > min_dim {
+        return Err(SvdLibError::invalid(format!(
+            "randomized: rank {} exceeds min(rows, cols) = {min_dim}",
+            cfg.rank
+        )));
+    }
+    if let Sketch::BlockKrylov { blocks } = cfg.sketch {
+        if blocks == 0 {
+            return Err(SvdLibError::invalid(
+                "randomized: block_krylov needs at least one block",
+            ));
+        }
+    }
+
+    let rank = cfg.rank;
+    // Sketch width, capped so the basis cannot exceed the operand's rank.
+    let l = (rank + cfg.oversamples).min(min_dim);
+    let seed = cfg.seed.unwrap_or_else(|| rng().next_u64());
+    let mut rng_state = StdRng::seed_from_u64(seed);
+
+    let means: Option<Array1<T>> = if cfg.mean_center {
+        note("computing column means");
+        Some(a.col_means())
     } else {
         None
     };
-    if verbose && mean_center {
-        println!(
-            "SVD | Randomized | Computed column means, took: {:?} of total running time",
-            start.elapsed()
-        );
-    }
+    let mut matvecs = 0usize;
 
-    let omega = generate_random_matrix(m_cols, l, seed);
+    // Product helpers that apply centering when configured.
+    let mul = |rhs: &Array2<T>, out: &mut Array2<T>, trans: bool| match &means {
+        Some(m) => a.mul_dense_centered(rhs.view(), out.view_mut(), trans, m.view()),
+        None => a.mul_dense(rhs.view(), out.view_mut(), trans),
+    };
 
-    let mut y = DMatrix::<T>::zeros(m_rows, l);
-    if verbose {
-        println!("SVD | Randomized | Multiplying m with omega matrix....");
-    }
-    multiply_matrix_centered(m, &omega, &mut y, false, &column_means);
-    if verbose {
-        println!(
-            "SVD | Randomized | Multiplication done, took: {:?} of total running time",
-            start.elapsed()
-        );
-    }
-    if verbose {
-        println!("SVD | Randomized | Starting power iterations....");
-    }
-    if n_power_iters > 0 {
-        let mut z = DMatrix::<T>::zeros(m_cols, l);
+    note("drawing the random sketch");
+    let omega = gaussian(cols, l, &mut rng_state);
 
-        for i in 0..n_power_iters {
-            if verbose {
-                println!(
-                    "SVD | Randomized | Running power-iteration: {:?}, current time: {:?}",
-                    i,
-                    start.elapsed()
-                );
-            }
-            multiply_matrix_centered(m, &y, &mut z, true, &column_means);
-            if verbose {
-                println!(
-                    "SVD | Randomized | Forward Multiplication {:?}",
-                    start.elapsed()
-                );
-            }
-            match power_iteration_normalizer {
-                PowerIterationNormalizer::QR => {
-                    let qr = z.qr();
-                    z = qr.q();
-                    // After QR normalization, z has fewer columns, so we need to resize y
-                    y = DMatrix::<T>::zeros(m_rows, z.ncols());
-                }
-                PowerIterationNormalizer::LU => {
-                    normalize_columns(&mut z);
-                }
-                PowerIterationNormalizer::None => {}
-            }
-            if verbose {
-                println!(
-                    "SVD | Randomized | Power Iteration Normalization Forward-Step {:?}",
-                    start.elapsed()
-                );
-            }
+    // ----- Stage 1: build a basis for the range of A -----
+    let mut basis = match cfg.sketch {
+        Sketch::PowerIteration { iterations } => {
+            note("projecting");
+            let mut y = Array2::<T>::zeros((rows, l));
+            mul(&omega, &mut y, false);
+            matvecs += l;
+            normalize(&mut y, cfg.normalizer)?;
 
-            multiply_matrix_centered(m, &z, &mut y, false, &column_means);
-            if verbose {
-                println!(
-                    "SVD | Randomized | Backward Multiplication {:?}",
-                    start.elapsed()
-                );
+            let mut z = Array2::<T>::zeros((cols, l));
+            for i in 0..iterations {
+                note(&format!("power iteration {}/{}", i + 1, iterations));
+                mul(&y, &mut z, true);
+                matvecs += l;
+                normalize(&mut z, cfg.normalizer)?;
+                mul(&z, &mut y, false);
+                matvecs += l;
+                normalize(&mut y, cfg.normalizer)?;
             }
-            match power_iteration_normalizer {
-                PowerIterationNormalizer::QR => {
-                    let qr = y.qr();
-                    y = qr.q();
-                }
-                PowerIterationNormalizer::LU => normalize_columns(&mut y),
-                PowerIterationNormalizer::None => {}
-            }
-            if verbose {
-                println!(
-                    "SVD | Randomized | Power Iteration Normalization Backward-Step {:?}",
-                    start.elapsed()
-                );
-            }
+            y
         }
-    }
-    if verbose {
-        println!(
-            "SVD | Randomized | Running QR-Normalization after Power-Iterations {:?}",
-            start.elapsed()
-        );
-    }
-    let qr = y.qr();
-    let y = qr.q();
-    if verbose {
-        println!(
-            "SVD | Randomized | Finished QR-Normalization after Power-Iterations {:?}",
-            start.elapsed()
-        );
-    }
+        Sketch::BlockKrylov { blocks } => {
+            note("building the Krylov block basis");
+            // The range of A has dimension at most min(rows, cols), so a basis wider
+            // than that is necessarily rank-deficient. Clamping to `rows` alone is not
+            // enough: on a 500x60 operand, 4 blocks of 22 would give an 88-column basis
+            // whose `Aᵀ·basis` is 60x88 — wider than tall, which no QR accepts.
+            let width = (blocks * l).min(min_dim);
+            let mut k = Array2::<T>::zeros((rows, width));
+            let mut y = Array2::<T>::zeros((rows, l));
+            let mut z = Array2::<T>::zeros((cols, l));
 
-    let mut b = DMatrix::<T>::zeros(y.ncols(), m_cols);
-    multiply_transposed_by_matrix_centered(&y, m, &mut b, &column_means);
-    if verbose {
-        println!(
-            "SVD | Randomized | Transposed Matrix Multiplication {:?}",
-            start.elapsed()
-        );
-    }
-    let svd = b.svd(true, true);
-    if verbose {
-        println!(
-            "SVD | Randomized | Running Singular Value Decomposition, took {:?}",
-            start.elapsed()
-        );
-    }
-    let u_b = svd
-        .u
-        .ok_or_else(|| SvdLibError::Las2Error("SVD U computation failed".to_string()))?;
-    let singular_values = svd.singular_values;
-    let vt = svd
-        .v_t
-        .ok_or_else(|| SvdLibError::Las2Error("SVD V_t computation failed".to_string()))?;
+            mul(&omega, &mut y, false);
+            matvecs += l;
+            normalize(&mut y, cfg.normalizer)?;
 
-    let u = y.mul(&u_b);
-    let actual_rank = target_rank.min(singular_values.len());
+            let mut filled = 0usize;
+            for b in 0..blocks {
+                if filled >= width {
+                    break;
+                }
+                let take = l.min(width - filled);
+                k.slice_mut(s![.., filled..filled + take])
+                    .assign(&y.slice(s![.., ..take]));
+                filled += take;
+                if b + 1 == blocks {
+                    break;
+                }
+                note(&format!("krylov block {}/{}", b + 2, blocks));
+                mul(&y, &mut z, true);
+                matvecs += l;
+                normalize(&mut z, cfg.normalizer)?;
+                mul(&z, &mut y, false);
+                matvecs += l;
+                normalize(&mut y, cfg.normalizer)?;
+            }
+            if filled < width {
+                k = k.slice(s![.., ..filled]).to_owned();
+            }
+            k
+        }
+    };
 
-    let u_subset = u.columns(0, actual_rank);
-    let s = convert_singular_values(
-        <DVector<T>>::from(singular_values.rows(0, actual_rank)),
-        actual_rank,
-    );
-    let vt_subset = vt.rows(0, actual_rank).into_owned();
-    let u = u_subset.into_owned().into_ndarray2();
-    let vt = vt_subset.into_ndarray2();
+    note("orthonormalising the basis");
+    tsqr(&mut basis)?;
+    let width = basis.ncols();
+
+    // ----- Stage 2: project and factor -----
+    //
+    // `bt = Aᵀ·basis` is tall-skinny, so TSQR it and take the SVD of the small `R`
+    // rather than factoring the wide `basis ᵀ·A` directly.
+    note("projecting onto the basis");
+    let mut bt = Array2::<T>::zeros((cols, width));
+    mul(&basis, &mut bt, true);
+    matvecs += width;
+
+    note("reducing");
+    let r_c = tsqr(&mut bt)?; // bt is now Q_c (cols × width), r_c is width × width
+    let small = small_svd(r_c.t())?; // SVD of R_cᵀ
+
+    // A ≈ (basis·Û)·Ŝ·(Q_c·V̂)ᵀ
+    let keep = rank.min(small.s.len());
+    let u_hat = small.u.slice(s![.., ..keep]);
+    let v_hat = small.vt.slice(s![..keep, ..]).t().to_owned(); // width × keep
+
+    let mut u = basis.dot(&u_hat);
+    let mut vt = bt
+        .dot(&v_hat)
+        .reversed_axes()
+        .as_standard_layout()
+        .to_owned();
+    let s = small.s.slice(s![..keep]).to_owned();
+
+    svd_flip(&mut u, &mut vt);
+
+    let (oversamples, power_iterations, block_size) = match cfg.sketch {
+        Sketch::PowerIteration { iterations } => (cfg.oversamples, iterations, l),
+        Sketch::BlockKrylov { blocks } => (cfg.oversamples, blocks, l),
+    };
+
     Ok(SvdRec {
-        d: actual_rank,
+        d: keep,
         u,
         s,
         vt,
-        diagnostics: create_diagnostics(
-            m,
-            actual_rank,
-            target_rank,
-            n_power_iters,
-            seed.unwrap_or(0) as u32,
-        ),
+        total_squared_norm: T::from_f64_val(crate::matrix::total_squared_norm(
+            a,
+            means.as_ref().map(|m| m.view()),
+        )),
+        diagnostics: Diagnostics {
+            algorithm: match cfg.sketch {
+                Sketch::PowerIteration { .. } => Algorithm::Randomized,
+                Sketch::BlockKrylov { .. } => Algorithm::BlockKrylov,
+            },
+            non_zero: a.nnz(),
+            dimensions: rank,
+            significant_values: keep,
+            transposed: false,
+            random_seed: seed,
+            matvecs,
+            detail: Detail::Randomized {
+                oversamples,
+                power_iterations,
+                block_size,
+            },
+        },
     })
 }
 
-fn convert_singular_values<T: SvdFloat + ComplexField>(
-    values: DVector<T::RealField>,
-    size: usize,
-) -> Array1<T> {
-    let mut array = Array1::zeros(size);
-
-    for i in 0..size {
-        array[i] = T::from_real(values[i].clone());
-    }
-
-    array
+/// A `rows × cols` matrix of standard normal draws.
+fn gaussian<T: SvdFloat>(rows: usize, cols: usize, rng: &mut StdRng) -> Array2<T> {
+    let normal = Normal::new(0.0, 1.0).expect("N(0,1) is well-formed");
+    Array2::from_shape_fn((rows, cols), |_| T::from_f64_val(normal.sample(rng)))
 }
 
-fn create_diagnostics<T, M: SMat<T>>(
-    a: &M,
-    d: usize,
-    target_rank: usize,
-    power_iterations: usize,
-    seed: u32,
-) -> Diagnostics<T>
-where
-    T: SvdFloat,
-{
-    Diagnostics {
-        non_zero: a.nnz(),
-        dimensions: target_rank,
-        iterations: power_iterations,
-        transposed: false,
-        lanczos_steps: 0, // we dont do that
-        ritz_values_stabilized: d,
-        significant_values: d,
-        singular_values: d,
-        end_interval: [T::from(-1e-30).unwrap(), T::from(1e-30).unwrap()],
-        kappa: T::from(1e-6).unwrap(),
-        random_seed: seed,
-    }
-}
-
-fn normalize_columns<T: SvdFloat + RealField + Send + Sync>(matrix: &mut DMatrix<T>) {
-    let rows = matrix.nrows();
-    let cols = matrix.ncols();
-
-    if rows < PARALLEL_THRESHOLD_ROWS && cols < PARALLEL_THRESHOLD_COLS {
-        for j in 0..cols {
-            let mut norm = T::zero();
-
-            // Calculate column norm
-            for i in 0..rows {
-                norm += ComplexField::powi(matrix[(i, j)], 2);
-            }
-            norm = ComplexField::sqrt(norm);
-
-            if norm > T::from_f64(1e-10).unwrap() {
-                let scale = T::one() / norm;
-                for i in 0..rows {
-                    matrix[(i, j)] *= scale;
+fn normalize<T: SvdFloat>(m: &mut Array2<T>, how: Normalizer) -> Result<()> {
+    match how {
+        Normalizer::Tsqr => {
+            tsqr(m)?;
+            Ok(())
+        }
+        Normalizer::ColumnNorm => {
+            let floor = T::from_f64_val(1e-10);
+            for mut col in m.axis_iter_mut(Axis(1)) {
+                let n = col.iter().map(|&x| x * x).sum::<T>().sqrt();
+                if n > floor {
+                    let inv = T::one() / n;
+                    col.map_inplace(|x| *x *= inv);
                 }
             }
+            Ok(())
         }
-        return;
+        Normalizer::None => Ok(()),
     }
-
-    let norms: Vec<T> = (0..cols)
-        .into_par_iter()
-        .map(|j| {
-            let mut norm = T::zero();
-            for i in 0..rows {
-                let val = unsafe { *matrix.get_unchecked((i, j)) };
-                norm += ComplexField::powi(val, 2);
-            }
-            ComplexField::sqrt(norm)
-        })
-        .collect();
-
-    let scales: Vec<(usize, T)> = norms
-        .into_iter()
-        .enumerate()
-        .filter_map(|(j, norm)| {
-            if norm > T::from_f64(1e-10).unwrap() {
-                Some((j, T::one() / norm))
-            } else {
-                None // Skip columns with too small norms
-            }
-        })
-        .collect();
-
-    scales.iter().for_each(|(j, scale)| {
-        for i in 0..rows {
-            let value = matrix.get_mut((i, *j)).unwrap();
-            *value = value.clone() * scale.clone();
-        }
-    });
-}
-
-// ----------------------------------------
-// Utils Functions
-// ----------------------------------------
-
-fn generate_random_matrix<T: SvdFloat + RealField>(
-    rows: usize,
-    cols: usize,
-    seed: Option<u64>,
-) -> DMatrix<T> {
-    let mut rng = match seed {
-        Some(s) => StdRng::seed_from_u64(s),
-        None => StdRng::seed_from_u64(0),
-    };
-
-    let normal = Normal::new(0.0, 1.0).unwrap();
-    DMatrix::from_fn(rows, cols, |_, _| {
-        T::from_f64(normal.sample(&mut rng)).unwrap()
-    })
-}
-
-fn multiply_matrix<T: SvdFloat, M: SMat<T>>(
-    sparse: &M,
-    dense: &DMatrix<T>,
-    result: &mut DMatrix<T>,
-    transpose_sparse: bool,
-) {
-    sparse.multiply_with_dense(dense, result, transpose_sparse)
-}
-
-fn multiply_transposed_by_matrix<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
-    q: &DMatrix<T>,
-    sparse: &M,
-    result: &mut DMatrix<T>,
-) {
-    sparse.multiply_transposed_by_dense(q, result);
-}
-
-pub fn svd_flip<T: SvdFloat + 'static>(
-    u: Option<&mut DMatrix<T>>,
-    v: Option<&mut DMatrix<T>>,
-    u_based_decision: bool,
-) -> Result<(), SvdLibError> {
-    if u.is_none() && v.is_none() {
-        return Err(SvdLibError::Las2Error(
-            "Both u and v cannot be None".to_string(),
-        ));
-    }
-
-    if u_based_decision {
-        if u.is_none() {
-            return Err(SvdLibError::Las2Error(
-                "u cannot be None when u_based_decision is true".to_string(),
-            ));
-        }
-
-        let u = u.unwrap();
-        let ncols = u.ncols();
-        let nrows = u.nrows();
-
-        let mut signs = DVector::from_element(ncols, T::one());
-
-        for j in 0..ncols {
-            let mut max_abs = T::zero();
-            let mut max_idx = 0;
-
-            for i in 0..nrows {
-                let abs_val = num_traits::Float::abs(u[(i, j)]);
-                if abs_val > max_abs {
-                    max_abs = abs_val;
-                    max_idx = i;
-                }
-            }
-
-            if u[(max_idx, j)] < T::zero() {
-                signs[j] = -T::one();
-            }
-        }
-
-        for j in 0..ncols {
-            for i in 0..nrows {
-                u[(i, j)] *= signs[j];
-            }
-        }
-
-        if let Some(v) = v {
-            let v_nrows = v.nrows();
-            let v_ncols = v.ncols();
-
-            for i in 0..v_nrows.min(signs.len()) {
-                for j in 0..v_ncols {
-                    v[(i, j)] *= signs[i];
-                }
-            }
-        }
-    } else {
-        if v.is_none() {
-            return Err(SvdLibError::Las2Error(
-                "v cannot be None when u_based_decision is false".to_string(),
-            ));
-        }
-
-        let v = v.unwrap();
-        let nrows = v.nrows();
-        let ncols = v.ncols();
-
-        let mut signs = DVector::from_element(nrows, T::one());
-
-        for i in 0..nrows {
-            let mut max_abs = T::zero();
-            let mut max_idx = 0;
-
-            for j in 0..ncols {
-                let abs_val = num_traits::Float::abs(v[(i, j)]);
-                if abs_val > max_abs {
-                    max_abs = abs_val;
-                    max_idx = j;
-                }
-            }
-
-            if v[(i, max_idx)] < T::zero() {
-                signs[i] = -T::one();
-            }
-        }
-
-        for i in 0..nrows {
-            for j in 0..ncols {
-                v[(i, j)] *= signs[i];
-            }
-        }
-
-        if let Some(u) = u {
-            let u_nrows = u.nrows();
-            let u_ncols = u.ncols();
-
-            for j in 0..u_ncols.min(signs.len()) {
-                for i in 0..u_nrows {
-                    u[(i, j)] *= signs[j];
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn multiply_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
-    sparse: &M,
-    dense: &DMatrix<T>,
-    result: &mut DMatrix<T>,
-    transpose_sparse: bool,
-    column_means: &Option<DVector<T>>,
-) {
-    if column_means.is_none() {
-        multiply_matrix(sparse, dense, result, transpose_sparse);
-        return;
-    }
-
-    let means = column_means.as_ref().unwrap();
-    sparse.multiply_with_dense_centered(dense, result, transpose_sparse, means)
-}
-
-fn multiply_transposed_by_matrix_centered<T: SvdFloat, M: SMat<T> + std::marker::Sync>(
-    q: &DMatrix<T>,
-    sparse: &M,
-    result: &mut DMatrix<T>,
-    column_means: &Option<DVector<T>>,
-) {
-     if column_means.is_none() {
-        multiply_transposed_by_matrix(q, sparse, result);
-        return;
-    }
-
-    let means = column_means.as_ref().unwrap();
-    sparse.multiply_transposed_by_dense_centered(q, result, means);
 }
 
 #[cfg(test)]
-mod randomized_svd_tests {
+mod tests {
     use super::*;
-    use crate::randomized::{randomized_svd, PowerIterationNormalizer};
-    use nalgebra_sparse::coo::CooMatrix;
-    use nalgebra_sparse::CsrMatrix;
-    use ndarray::Array2;
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use rayon::ThreadPoolBuilder;
-    use std::sync::Once;
+    use crate::matrix::SvdMat;
+    use crate::testing::{dense_of, gen_lowrank, gen_sparse, reference_singular_values, Lcg};
+    use sprs::TriMatI;
 
-    static INIT: Once = Once::new();
-
-    fn setup_thread_pool() {
-        INIT.call_once(|| {
-            ThreadPoolBuilder::new()
-                .num_threads(16)
-                .build_global()
-                .expect("Failed to build global thread pool");
-
-            println!("Initialized thread pool with {} threads", 16);
-        });
-    }
-
-    fn create_sparse_matrix(
-        rows: usize,
-        cols: usize,
-        density: f64,
-    ) -> nalgebra_sparse::coo::CooMatrix<f64> {
-        use std::collections::HashSet;
-
-        let mut coo = nalgebra_sparse::coo::CooMatrix::new(rows, cols);
-
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let nnz = (rows as f64 * cols as f64 * density).round() as usize;
-
-        let nnz = nnz.max(1);
-
-        let mut positions = HashSet::new();
-
-        while positions.len() < nnz {
-            let i = rng.gen_range(0..rows);
-            let j = rng.gen_range(0..cols);
-
-            if positions.insert((i, j)) {
-                let val = loop {
-                    let v: f64 = rng.gen_range(-10.0..10.0);
-                    if v.abs() > 1e-10 {
-                        break v;
-                    }
-                };
-
-                coo.push(i, j, val);
-            }
+    fn diagonal(n: usize) -> SvdMat<f64> {
+        let mut t = TriMatI::<f64, u32>::new((n, n));
+        for i in 0..n {
+            t.add_triplet(i, i, (n - i) as f64);
         }
-
-        let actual_density = coo.nnz() as f64 / (rows as f64 * cols as f64);
-        println!("Created sparse matrix: {} x {}", rows, cols);
-        println!("  - Requested density: {:.6}", density);
-        println!("  - Actual density: {:.6}", actual_density);
-        println!("  - Sparsity: {:.4}%", (1.0 - actual_density) * 100.0);
-        println!("  - Non-zeros: {}", coo.nnz());
-
-        coo
+        t.to_csr::<u64>()
     }
 
+    /// Worst relative error against a dense LAPACK reference.
+    fn max_rel_error(a: &SvdMat<f64>, got: &SvdRec<f64>) -> f64 {
+        let want = reference_singular_values(&dense_of(a));
+        got.s
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| (g - want[i]).abs() / want[i].abs().max(1e-30))
+            .fold(0.0f64, f64::max)
+    }
+
+    /// A rapidly-decaying spectrum is the regime randomized SVD is designed for, so
+    /// accuracy there should be high even with modest power iterations.
     #[test]
-    fn test_randomized_svd_accuracy() {
-        setup_thread_pool();
+    fn accurate_on_decaying_spectrum() {
+        let a = gen_lowrank(400, 120, 10, 5);
+        let got = svd_seed(&a, 10, 42).unwrap();
+        let err = max_rel_error(&a, &got);
+        assert!(err < 1e-6, "max relative error {err:.3e}");
+    }
 
-        let coo = create_sparse_matrix(500, 40, 0.1);
-
-
-        let csr = CsrMatrix::from(&coo);
-
-        let mut std_svd = crate::lanczos::svd_dim_seed(&csr, 10, 42).unwrap();
-
-        let rand_svd = randomized_svd(
-            &csr,
-            10,
-            5,
-            4,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            true,
+    /// `diag(60..1)` decays only linearly, so `sigma_11/sigma_10 = 0.98` and the
+    /// randomized error bound `~(sigma_{k+1}/sigma_k)^(2q+1)` barely improves with `q`.
+    /// This is a limitation of the method, not a defect: assert the behaviour theory
+    /// predicts rather than an accuracy it cannot deliver.
+    #[test]
+    fn power_iteration_converges_slowly_on_linear_decay() {
+        let a = diagonal(60);
+        let loose = svd_with(
+            &a,
+            &RandomizedConfig::new(10).seed(42).power_iterations(0),
+            None,
         )
         .unwrap();
-
-        assert_eq!(rand_svd.d, 10, "Expected rank of 10");
-
-        let rel_tol = 0.4;
-        let compare_count = std::cmp::min(std_svd.d, rand_svd.d);
-        println!("Standard SVD has {} dimensions", std_svd.d);
-        println!("Randomized SVD has {} dimensions", rand_svd.d);
-
-        for i in 0..compare_count {
-            let rel_diff = (std_svd.s[i] - rand_svd.s[i]).abs() / std_svd.s[i];
-            println!(
-                "Singular value {}: standard={}, randomized={}, rel_diff={}",
-                i, std_svd.s[i], rand_svd.s[i], rel_diff
-            );
-            assert!(
-                rel_diff < rel_tol,
-                "Dominant singular value {} differs too much: rel diff = {}, standard = {}, randomized = {}",
-                i, rel_diff, std_svd.s[i], rand_svd.s[i]
-            );
-        }
-
-
-    }
-
-    // Test with mean centering
-    #[test]
-    fn test_randomized_svd_with_mean_centering() {
-        setup_thread_pool();
-
-        let mut coo = CooMatrix::<f64>::new(30, 10);
-        let mut rng = StdRng::seed_from_u64(123);
-
-        let column_means: Vec<f64> = (0..10).map(|i| i as f64 * 2.0).collect();
-
-        let mut u = vec![vec![0.0; 3]; 30]; // 3 factors
-        let mut v = vec![vec![0.0; 3]; 10];
-
-        for i in 0..30 {
-            for j in 0..3 {
-                u[i][j] = rng.gen_range(-1.0..1.0);
-            }
-        }
-
-        for i in 0..10 {
-            for j in 0..3 {
-                v[i][j] = rng.gen_range(-1.0..1.0);
-            }
-        }
-
-        for i in 0..30 {
-            for j in 0..10 {
-                let mut val = 0.0;
-                for k in 0..3 {
-                    val += u[i][k] * v[j][k];
-                }
-                val = val + column_means[j] + rng.gen_range(-0.1..0.1);
-                coo.push(i, j, val);
-            }
-        }
-
-        let csr = CsrMatrix::from(&coo);
-
-        let svd_no_center = randomized_svd(
-            &csr,
-            3,
-            3,
-            2,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            false,
+        let tight = svd_with(
+            &a,
+            &RandomizedConfig::new(10).seed(42).power_iterations(7),
+            None,
         )
         .unwrap();
-
-        let svd_with_center = randomized_svd(
-            &csr,
-            3,
-            3,
-            2,
-            PowerIterationNormalizer::QR,
-            true,
-            Some(42),
-            false,
-        )
-        .unwrap();
-
-        println!("Singular values without centering: {:?}", svd_no_center.s);
-        println!("Singular values with centering: {:?}", svd_with_center.s);
-    }
-
-    #[test]
-    fn test_randomized_svd_large_sparse() {
-        setup_thread_pool();
-
-        let test_matrix = create_sparse_matrix(5000, 1000, 0.01);
-
-        let csr = CsrMatrix::from(&test_matrix);
-
-        let result = randomized_svd(
-            &csr,
-            20,
-            10,
-            2,
-            PowerIterationNormalizer::QR,
-            false,
-            Some(42),
-            false,
-        );
-
+        let e0 = max_rel_error(&a, &loose);
+        let e7 = max_rel_error(&a, &tight);
         assert!(
-            result.is_ok(),
-            "Randomized SVD failed on large sparse matrix: {:?}",
-            result.err().unwrap()
+            e0 > 1e-2,
+            "q=0 should be visibly inaccurate here, got {e0:.3e}"
         );
+        assert!(
+            e7 < e0 / 50.0,
+            "7 power iterations should improve substantially: {e0:.3e} -> {e7:.3e}"
+        );
+    }
 
-        let svd = result.unwrap();
-        assert_eq!(svd.d, 20, "Expected rank of 20");
-        assert_eq!(svd.u.ncols(), 20, "Expected 20 left singular vectors");
-        assert_eq!(svd.u.nrows(), 5000, "Expected 5000 columns in U transpose");
-        assert_eq!(svd.vt.nrows(), 20, "Expected 20 right singular vectors");
-        assert_eq!(svd.vt.ncols(), 1000, "Expected 1000 columns in V transpose");
+    /// Block Krylov is the answer for that same matrix: retaining every block spans the
+    /// dominant subspace essentially exactly, reaching machine precision where power
+    /// iteration is still at 1e-4.
+    #[test]
+    fn block_krylov_is_near_exact_on_linear_decay() {
+        let a = diagonal(60);
+        let got = svd_with(
+            &a,
+            &RandomizedConfig::new(10).seed(42).block_krylov(4),
+            None,
+        )
+        .unwrap();
+        let err = max_rel_error(&a, &got);
+        assert!(err < 1e-10, "block krylov max relative error {err:.3e}");
+    }
 
-        for i in 1..svd.s.len() {
-            assert!(svd.s[i] > 0.0, "Singular values should be positive");
+    /// More power iterations must not make the answer worse.
+    #[test]
+    fn power_iterations_improve_accuracy() {
+        let a = gen_sparse(600, 200, 0.05, 13);
+        let mut prev = f64::INFINITY;
+        for q in [0usize, 1, 2, 4, 7] {
+            let cfg = RandomizedConfig::new(15).seed(42).power_iterations(q);
+            let got = svd_with(&a, &cfg, None).unwrap();
+            let err = max_rel_error(&a, &got);
             assert!(
-                svd.s[i - 1] >= svd.s[i],
-                "Singular values should be in descending order"
+                err <= prev * 1.5 + 1e-9,
+                "q={q} error {err:.3e} is worse than q's predecessor {prev:.3e}"
+            );
+            prev = err;
+        }
+        // A near-flat spectrum (ratio 0.999) cannot be driven to high accuracy by
+        // power iteration at any practical `q`; what must hold is a large improvement
+        // over the un-iterated sketch.
+        let plain = svd_with(
+            &a,
+            &RandomizedConfig::new(15).seed(42).power_iterations(0),
+            None,
+        )
+        .unwrap();
+        let e0 = max_rel_error(&a, &plain);
+        assert!(
+            prev < e0 / 10.0,
+            "7 power iterations ({prev:.3e}) should be well under the q=0 error ({e0:.3e})"
+        );
+    }
+
+    /// Block Krylov should beat plain power iteration at equal matrix-product budget on
+    /// a slowly-decaying spectrum, which is exactly what it exists for.
+    #[test]
+    fn block_krylov_beats_power_iteration_on_flat_spectrum() {
+        // A near-flat spectrum: random sparse, no low-rank structure.
+        let a = gen_sparse(800, 200, 0.04, 29);
+        let rank = 20;
+
+        let power = svd_with(
+            &a,
+            &RandomizedConfig::new(rank).seed(42).power_iterations(3),
+            None,
+        )
+        .unwrap();
+        let krylov = svd_with(
+            &a,
+            &RandomizedConfig::new(rank).seed(42).block_krylov(4),
+            None,
+        )
+        .unwrap();
+
+        let e_power = max_rel_error(&a, &power);
+        let e_krylov = max_rel_error(&a, &krylov);
+        assert!(
+            e_krylov <= e_power,
+            "block krylov {e_krylov:.3e} did not improve on power iteration {e_power:.3e}"
+        );
+        assert_eq!(krylov.diagnostics.algorithm, Algorithm::BlockKrylov);
+    }
+
+    #[test]
+    fn orientation_is_correct_for_wide_and_tall() {
+        for (r, c) in [(400usize, 80usize), (80, 400)] {
+            let a = gen_sparse(r, c, 0.08, 11);
+            let got = svd_seed(&a, 10, 42).unwrap();
+            assert_eq!(got.u.dim(), (r, 10), "u shape for {r}x{c}");
+            assert_eq!(got.vt.dim(), (10, c), "vt shape for {r}x{c}");
+        }
+    }
+
+    #[test]
+    fn singular_vectors_are_orthonormal() {
+        let a = gen_lowrank(300, 100, 12, 71);
+        let got = svd_seed(&a, 12, 42).unwrap();
+        let ou = crate::dense::orthogonality_error(&got.u.view());
+        assert!(ou < 1e-8, "||UᵀU - I|| = {ou:.3e}");
+        let vt_t = got.vt.t().to_owned();
+        let ov = crate::dense::orthogonality_error(&vt_t.view());
+        assert!(ov < 1e-8, "||VᵀV - I|| = {ov:.3e}");
+    }
+
+    /// The whole point of the 2.0 rewrite: this used to panic with `todo!()` for every
+    /// stock matrix type.
+    #[test]
+    fn works_on_csr_and_csc_without_panicking() {
+        let a = gen_sparse(300, 120, 0.05, 3);
+        let csc = a.to_other_storage();
+        let x = svd_seed(&a, 10, 42).unwrap();
+        let y = svd_seed(&csc, 10, 42).unwrap();
+        for (p, q) in x.s.iter().zip(y.s.iter()) {
+            approx::assert_relative_eq!(p, q, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn works_on_masked_matrices() {
+        let a = gen_sparse(300, 60, 0.1, 19);
+        let cols: Vec<usize> = (0..60).filter(|c| c % 2 == 0).collect();
+        let masked = crate::matrix::MaskedCsMat::with_columns(&a, &cols);
+        let got = svd_seed(&masked, 8, 42).unwrap();
+        assert_eq!(got.u.nrows(), 300);
+        assert_eq!(got.vt.ncols(), 30);
+        for w in got.s.to_vec().windows(2) {
+            assert!(w[0] >= w[1]);
+        }
+    }
+
+    /// Mean centering must agree with an explicitly centered dense reference.
+    #[test]
+    fn mean_centering_matches_dense_pca() {
+        let a = gen_lowrank(300, 60, 8, 37);
+        let dense = dense_of(&a);
+        let means = dense.mean_axis(Axis(0)).unwrap();
+        let centered = &dense - &means.view().insert_axis(Axis(0));
+        let want = reference_singular_values(&centered);
+
+        let cfg = RandomizedConfig::new(8)
+            .seed(42)
+            .mean_center(true)
+            .power_iterations(5);
+        let got = svd_with(&a, &cfg, None).unwrap();
+        for (i, &g) in got.s.iter().enumerate() {
+            let rel = (g - want[i]).abs() / want[i].abs().max(1e-30);
+            assert!(
+                rel < 1e-5,
+                "centered singular value {i}: {g:.9e} vs {:.9e} (rel {rel:.3e})",
+                want[i]
             );
         }
     }
 
-    // Test with different power iteration settings
+    /// `None` must actually vary the sketch. 1.x substituted seed 0 for `None`, so
+    /// successive calls were identical.
     #[test]
-    fn test_power_iteration_impact() {
-        setup_thread_pool();
-
-        let mut coo = CooMatrix::<f64>::new(100, 50);
-        let mut rng = StdRng::seed_from_u64(987);
-
-        let mut u = vec![vec![0.0; 10]; 100];
-        let mut v = vec![vec![0.0; 10]; 50];
-
-        for i in 0..100 {
-            for j in 0..10 {
-                u[i][j] = rng.random_range(-1.0..1.0);
-            }
-        }
-
-        for i in 0..50 {
-            for j in 0..10 {
-                v[i][j] = rng.random_range(-1.0..1.0);
-            }
-        }
-
-        for i in 0..100 {
-            for j in 0..50 {
-                let mut val = 0.0;
-                for k in 0..10 {
-                    val += u[i][k] * v[j][k];
-                }
-                val += rng.random_range(-0.01..0.01);
-                coo.push(i, j, val);
-            }
-        }
-
-        let csr = CsrMatrix::from(&coo);
-
-        let powers = [0, 1, 3, 5];
-        let mut errors = Vec::new();
-
-        let mut dense_mat = Array2::<f64>::zeros((100, 50));
-        for (i, j, val) in csr.triplet_iter() {
-            dense_mat[[i, j]] = *val;
-        }
-        let matrix_norm = dense_mat.iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-
-        for &power in &powers {
-            let svd = randomized_svd(
-                &csr,
-                10,
-                5,
-                power,
-                PowerIterationNormalizer::QR,
-                false,
-                Some(42),
-                false,
-            )
-            .unwrap();
-
-            let recon = svd.recompose();
-            let mut error = 0.0;
-
-            for i in 0..100 {
-                for j in 0..50 {
-                    error += (dense_mat[[i, j]] - recon[[i, j]]).powi(2);
-                }
-            }
-
-            error = error.sqrt() / matrix_norm;
-            errors.push(error);
-
-            println!("Power iterations: {}, Relative error: {}", power, error);
-        }
-
-        let mut improved = false;
-        for i in 1..errors.len() {
-            if errors[i] < errors[0] * 0.9 {
-                improved = true;
-                break;
-            }
-        }
-
-        assert!(
-            improved,
-            "Power iterations did not improve accuracy as expected"
+    fn unseeded_runs_differ() {
+        let a = gen_sparse(300, 100, 0.05, 47);
+        let cfg = RandomizedConfig::new(6).power_iterations(0);
+        let x = svd_with(&a, &cfg, None).unwrap();
+        let y = svd_with(&a, &cfg, None).unwrap();
+        assert_ne!(
+            x.diagnostics.random_seed, y.diagnostics.random_seed,
+            "an unseeded config produced the same seed twice"
         );
+        // Zero power iterations makes the sketch dependence visible in the output.
+        assert_ne!(x.u, y.u, "unseeded runs produced identical bases");
+    }
+
+    #[test]
+    fn seeded_runs_are_reproducible() {
+        let a = gen_sparse(300, 100, 0.05, 51);
+        let x = svd_seed(&a, 8, 999).unwrap();
+        let y = svd_seed(&a, 8, 999).unwrap();
+        assert_eq!(x.s, y.s);
+        assert_eq!(x.u, y.u);
+        assert_eq!(x.vt, y.vt);
+    }
+
+    #[test]
+    fn agrees_with_irlba() {
+        let a = gen_lowrank(400, 150, 12, 61);
+        let rand = svd_with(
+            &a,
+            &RandomizedConfig::new(12).seed(42).power_iterations(6),
+            None,
+        )
+        .unwrap();
+        let exact = crate::irlba::svd_seed(&a, 12, 42).unwrap();
+        for i in 0..12 {
+            let rel = (rand.s[i] - exact.s[i]).abs() / exact.s[i];
+            assert!(rel < 1e-6, "triplet {i}: randomized vs irlba rel {rel:.3e}");
+        }
+    }
+
+    #[test]
+    fn normalizers_all_produce_usable_results() {
+        let a = gen_lowrank(400, 100, 10, 67);
+        for n in [Normalizer::Tsqr, Normalizer::ColumnNorm, Normalizer::None] {
+            let cfg = RandomizedConfig::new(10)
+                .seed(42)
+                .power_iterations(1)
+                .normalizer(n);
+            let got = svd_with(&a, &cfg, None).unwrap();
+            let err = max_rel_error(&a, &got);
+            assert!(err < 1e-2, "{n:?} gave max relative error {err:.3e}");
+        }
+    }
+
+    #[test]
+    fn progress_callback_is_invoked() {
+        let a = gen_sparse(200, 80, 0.1, 73);
+        let seen = std::sync::Mutex::new(Vec::<String>::new());
+        let sink = |msg: &str| seen.lock().unwrap().push(msg.to_string());
+        let cfg = RandomizedConfig::new(6).seed(42).power_iterations(2);
+        svd_with(&a, &cfg, Some(&sink)).unwrap();
+        let msgs = seen.into_inner().unwrap();
+        assert!(!msgs.is_empty(), "no progress reported");
+        assert!(
+            msgs.iter().any(|m| m.contains("power iteration")),
+            "power iterations were not reported: {msgs:?}"
+        );
+    }
+
+    /// Regression: a block count whose basis would exceed `min(rows, cols)` must clamp
+    /// rather than hand a wide matrix to the QR.
+    #[test]
+    fn block_krylov_clamps_basis_to_matrix_rank() {
+        // 500x60 with rank 12 + 10 oversamples = 22 per block; 4 blocks would be 88.
+        let a = gen_sparse(500, 60, 0.08, 7);
+        let got = svd_block_krylov(&a, 12, 4, Some(42)).expect("should clamp, not fail");
+        assert_eq!(got.d, 12);
+        assert_eq!(got.u.dim(), (500, 12));
+        assert_eq!(got.vt.dim(), (12, 60));
+
+        // Also the wide orientation.
+        let b = gen_sparse(60, 500, 0.08, 11);
+        let got = svd_block_krylov(&b, 12, 4, Some(42)).expect("should clamp, not fail");
+        assert_eq!(got.u.dim(), (60, 12));
+        assert_eq!(got.vt.dim(), (12, 500));
+    }
+
+    #[test]
+    fn rejects_bad_configuration() {
+        let a = gen_sparse(50, 30, 0.2, 1);
+        assert!(matches!(svd(&a, 0), Err(SvdLibError::InvalidArgument(_))));
+        assert!(matches!(svd(&a, 31), Err(SvdLibError::InvalidArgument(_))));
+        let cfg = RandomizedConfig::new(5).block_krylov(0);
+        assert!(matches!(
+            svd_with(&a, &cfg, None),
+            Err(SvdLibError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn f32_works() {
+        let a64 = gen_lowrank(300, 80, 8, 79);
+        let want = reference_singular_values(&dense_of(&a64));
+        let mut t = TriMatI::<f32, u32>::new((300, 80));
+        for (v, (i, j)) in a64.iter() {
+            t.add_triplet(i as usize, j as usize, *v as f32);
+        }
+        let a32: SvdMat<f32> = t.to_csr::<u64>();
+        let cfg = RandomizedConfig::new(8).seed(42).power_iterations(4);
+        let got = svd_with(&a32, &cfg, None).unwrap();
+        for (i, &g) in got.s.iter().enumerate() {
+            let rel = ((g as f64) - want[i]).abs() / want[i].abs().max(1e-30);
+            assert!(rel < 1e-3, "f32 singular value {i}: rel {rel:.3e}");
+        }
+    }
+
+    /// Oversampling beyond the operand's rank must clamp rather than overrun.
+    #[test]
+    fn oversampling_clamps_to_matrix_rank() {
+        let a = gen_sparse(40, 20, 0.3, 83);
+        let cfg = RandomizedConfig::new(5).seed(42).oversamples(1000);
+        let got = svd_with(&a, &cfg, None).unwrap();
+        assert_eq!(got.d, 5);
+        let mut rng = Lcg::new(1);
+        let _ = rng.next_u64();
+    }
+
+    #[test]
+    fn diagnostics_report_matvecs_and_algorithm() {
+        let a = gen_sparse(200, 80, 0.1, 89);
+        let got = svd_seed(&a, 6, 42).unwrap();
+        assert_eq!(got.diagnostics.algorithm, Algorithm::Randomized);
+        assert!(got.diagnostics.matvecs > 0);
+        match got.diagnostics.detail {
+            Detail::Randomized {
+                power_iterations, ..
+            } => {
+                assert_eq!(power_iterations, DEFAULT_POWER_ITERATIONS);
+            }
+            ref other => panic!("wrong detail variant: {other:?}"),
+        }
+    }
+
+    /// Characterises how each sketch converges as a function of spectral decay. Run
+    /// with `--ignored --nocapture` to see the table; it is the evidence behind the
+    /// guidance in the module docs about when to prefer block Krylov.
+    #[test]
+    #[ignore = "diagnostic, run explicitly"]
+    fn report_convergence_rates() {
+        let cases: Vec<(&str, SvdMat<f64>, usize)> = vec![
+            ("diag_60_linear", diagonal(60), 10),
+            ("lowrank_400x120_r10", gen_lowrank(400, 120, 10, 5), 10),
+            ("sparse_600x200_flat", gen_sparse(600, 200, 0.05, 13), 15),
+        ];
+        for (name, a, rank) in cases {
+            let want = reference_singular_values(&dense_of(&a));
+            print!(
+                "{name:<22} sigma_ratio={:.3}  ",
+                want[rank] / want[rank - 1]
+            );
+            for q in [0usize, 1, 2, 4, 7] {
+                let cfg = RandomizedConfig::new(rank).seed(42).power_iterations(q);
+                let got = svd_with(&a, &cfg, None).unwrap();
+                print!("q{q}={:.2e} ", max_rel_error(&a, &got));
+            }
+            for b in [2usize, 4] {
+                let cfg = RandomizedConfig::new(rank).seed(42).block_krylov(b);
+                let got = svd_with(&a, &cfg, None).unwrap();
+                print!("bk{b}={:.2e} ", max_rel_error(&a, &got));
+            }
+            println!();
+        }
     }
 }
