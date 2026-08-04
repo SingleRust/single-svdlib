@@ -48,7 +48,12 @@ fn irlba_work(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(20));
-    for work in [rank + 7, rank + 30, 2 * rank] {
+    // Deduped: these collide for some ranks, and criterion rejects duplicate IDs.
+    let mut widths = vec![rank + 7, rank + 30, 2 * rank];
+    widths.sort_unstable();
+    widths.dedup();
+
+    for work in widths {
         group.bench_with_input(BenchmarkId::from_parameter(work), &work, |b, &work| {
             b.iter(|| {
                 black_box(
