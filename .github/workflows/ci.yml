@@ -43,10 +43,19 @@ jobs:
       - name: Build at the declared MSRV
         run: cargo build --all-features
 
+  # Plain cargo-audit rather than rustsec/audit-check: that action reports through the
+  # Checks API, which needs `checks: write` and is unavailable to fork PRs entirely. It
+  # degrades to printing the report and does not reliably fail the job.
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Exits non-zero on vulnerabilities. Unsoundness warnings are printed but do not
+      # fail the build — they are usually in transitive crates we cannot bump.
+      - name: Audit
+        run: cargo audit
