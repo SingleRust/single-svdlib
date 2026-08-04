@@ -107,10 +107,7 @@ fn main() {
     let as_usize = matrix.indptr().len() * 8 + matrix.indices().len() * 8 + matrix.data().len() * 8;
     let as_dense = cells * genes * 8;
     println!("  {:?}, nnz = {}", build_time, matrix.nnz());
-    println!(
-        "  sparse (u32/u64 indices) : {:>8.2} GiB",
-        gib(bytes)
-    );
+    println!("  sparse (u32/u64 indices) : {:>8.2} GiB", gib(bytes));
     println!(
         "  sparse (usize indices)   : {:>8.2} GiB   (+{:.0}%)",
         gib(as_usize),
@@ -191,7 +188,10 @@ fn main() {
     let pca_copy =
         irlba::svd_centered(&extracted, components, Some(42)).expect("PCA on extraction failed");
     let copy_time = t.elapsed();
-    println!("  PCA {:?}  matvecs={}", copy_time, pca_copy.diagnostics.matvecs);
+    println!(
+        "  PCA {:?}  matvecs={}",
+        copy_time, pca_copy.diagnostics.matvecs
+    );
 
     // ---- agreement ----
     let worst = (0..components)

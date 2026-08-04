@@ -46,7 +46,10 @@ pub struct JacobiSvd {
 /// orthogonal columns, and returning it beats failing the caller's whole decomposition.
 pub fn jacobi_svd(a: &Array2<f64>) -> Option<JacobiSvd> {
     let (m, n) = a.dim();
-    debug_assert!(m >= n, "one-sided Jacobi needs at least as many rows as columns");
+    debug_assert!(
+        m >= n,
+        "one-sided Jacobi needs at least as many rows as columns"
+    );
 
     let mut w = a.clone(); // becomes U·Σ
     let mut v = Array2::<f64>::eye(n);
@@ -163,7 +166,11 @@ pub fn jacobi_svd(a: &Array2<f64>) -> Option<JacobiSvd> {
 
     // Descending, carrying the vectors along.
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&i, &j| sigma[j].partial_cmp(&sigma[i]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&i, &j| {
+        sigma[j]
+            .partial_cmp(&sigma[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // A column whose norm has fallen to the rounding floor holds noise, not direction:
     // its entries are the residue of cancellation and are *not* orthogonal to the other
@@ -197,7 +204,11 @@ pub fn jacobi_svd(a: &Array2<f64>) -> Option<JacobiSvd> {
     // in it: complete the deficient columns against the ones that are defined.
     complete_orthonormal_basis(&mut u, &deficient);
 
-    Some(JacobiSvd { u, s: s_out, v: v_out })
+    Some(JacobiSvd {
+        u,
+        s: s_out,
+        v: v_out,
+    })
 }
 
 /// Replace the listed columns of `u` with unit vectors orthogonal to every other column.
@@ -321,10 +332,17 @@ mod tests {
         a.column_mut(4).fill(0.0);
 
         let svd = jacobi_svd(&a).unwrap();
-        assert!(svd.s[4] < 1e-14, "expected a zero singular value, got {}", svd.s[4]);
+        assert!(
+            svd.s[4] < 1e-14,
+            "expected a zero singular value, got {}",
+            svd.s[4]
+        );
 
         let orth = crate::dense::orthogonality_error(&svd.u.view());
-        assert!(orth < 1e-12, "||U^T U - I|| = {orth:.3e} on a deficient operand");
+        assert!(
+            orth < 1e-12,
+            "||U^T U - I|| = {orth:.3e} on a deficient operand"
+        );
 
         let err = frob(&(&recompose(&svd) - &a)) / frob(&a);
         assert!(err < 1e-14, "reconstruction {err:.3e}");
@@ -336,7 +354,10 @@ mod tests {
         let svd = jacobi_svd(&a).unwrap();
         assert!(svd.s.iter().all(|&v| v == 0.0));
         let orth = crate::dense::orthogonality_error(&svd.u.view());
-        assert!(orth < 1e-12, "||U^T U - I|| = {orth:.3e} on the zero matrix");
+        assert!(
+            orth < 1e-12,
+            "||U^T U - I|| = {orth:.3e} on the zero matrix"
+        );
     }
 
     #[test]

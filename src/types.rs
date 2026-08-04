@@ -148,6 +148,11 @@ pub struct SvdRec<T> {
     pub s: Array1<T>,
     /// Transposed right singular vectors, `d × n`.
     pub vt: Array2<T>,
+    /// `‖A‖²_F` of what was decomposed — the centered matrix if the solver was centering.
+    ///
+    /// Recorded because a truncated result can't recover it: `Σᵢ sᵢ²` over the returned
+    /// `d` values is only the part that was kept, not the tail it's measured against.
+    pub total_squared_norm: T,
     pub diagnostics: Diagnostics<T>,
 }
 
@@ -163,14 +168,10 @@ impl<T: SvdFloat> SvdRec<T> {
 
     /// Whether an iterative method reached its tolerance.
     ///
-    /// Always `true` for the randomized methods: they perform a fixed amount of work and
-    /// complete by construction, and their accuracy is governed by the sketch size and
-    /// power iterations rather than by a convergence test. For [`Algorithm::Irlba`] this
-    /// is the real thing — `false` means the restart budget ran out and the triplets are
-    /// a best effort.
-    ///
-    /// [`crate::irlba`] refuses to return an unconverged result by default, so this is a
-    /// belt-and-braces check for callers who opted out of that.
+    /// Always `true` for the randomized methods — they do a fixed amount of work and have
+    /// no convergence test. For IRLBA it's real: `false` means the restart budget ran out.
+    /// IRLBA refuses to return such a result by default, so this only matters if you
+    /// called `allow_unconverged`.
     pub fn converged(&self) -> bool {
         match self.diagnostics.detail {
             Detail::Irlba { converged, .. } => converged,
@@ -178,16 +179,45 @@ impl<T: SvdFloat> SvdRec<T> {
         }
     }
 
-    /// The largest residual `‖A·vᵢ − σᵢ·uᵢ‖` over the returned triplets, when the
-    /// algorithm tracks one.
-    ///
-    /// Compare against `s[0]` to judge it: a residual of `1e-9 · σ_max` is excellent, one
-    /// of `0.1 · σ_max` means the answer is not usable.
+    /// Largest `‖A·vᵢ − σᵢ·uᵢ‖` over the returned triplets, for algorithms that track it.
+    /// Judge it against `s[0]`: `1e-9 · σ_max` is excellent, `0.1 · σ_max` is unusable.
     pub fn max_residual(&self) -> Option<T> {
         match self.diagnostics.detail {
             Detail::Irlba { max_residual, .. } => Some(max_residual),
             _ => None,
         }
+    }
+
+    /// PCA scores, `u · diag(s)`, shaped `m × d` — the embedding you'd cluster or plot.
+    pub fn scores(&self) -> Array2<T> {
+        &self.u * &self.s.view().insert_axis(ndarray::Axis(0))
+    }
+
+    /// `sᵢ² / (m − 1)`, matching sklearn's `explained_variance_`. Only a variance in the
+    /// statistical sense if the decomposition was centered.
+    pub fn explained_variance(&self) -> Array1<T> {
+        let denom = self.variance_denominator();
+        self.s.mapv(|si| si * si / denom)
+    }
+
+    /// Fraction of the total squared norm each component captures. Sums to at most 1,
+    /// and to zero (not `NaN`) for an all-zero input.
+    pub fn explained_variance_ratio(&self) -> Array1<T> {
+        if self.total_squared_norm <= T::zero() {
+            return Array1::zeros(self.s.len());
+        }
+        self.s.mapv(|si| si * si / self.total_squared_norm)
+    }
+
+    /// `‖A‖²_F / (m − 1)` — the same scale as
+    /// [`explained_variance`](Self::explained_variance).
+    pub fn total_variance(&self) -> T {
+        self.total_squared_norm / self.variance_denominator()
+    }
+
+    /// `m − 1`, floored at 1 so a one-row input gives zeros rather than dividing by zero.
+    fn variance_denominator(&self) -> T {
+        T::from_f64_val(self.nrows().saturating_sub(1).max(1) as f64)
     }
 
     /// Number of rows of the original matrix.
@@ -236,6 +266,7 @@ mod tests {
             u,
             s,
             vt,
+            total_squared_norm: 0.0,
             diagnostics: Diagnostics {
                 algorithm: Algorithm::Las2,
                 non_zero: 6,

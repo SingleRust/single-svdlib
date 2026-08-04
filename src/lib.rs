@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | [`irlba`] | thick-restarted Lanczos bidiagonalization | **default.** Accurate, memory bounded by the requested rank |
 //! | [`randomized`] | randomized range finder, power iteration or block Krylov | very large inputs where an approximation is acceptable |
-//! | [`lanczos`] | LAS2 from SVDLIBC | **deprecated, numerically unreliable** — see the module docs |
+//! | `lanczos` | LAS2 from SVDLIBC | **deprecated, numerically unreliable** — behind the off-by-default `las2` feature |
 //!
 //! # Quick start
 //!
@@ -51,6 +51,9 @@
 pub mod dense;
 pub mod error;
 pub mod irlba;
+/// LAS2, from SVDLIBC. Deprecated and numerically unreliable — enable `las2` only to
+/// keep a 1.x caller compiling while it moves to [`irlba`].
+#[cfg(feature = "las2")]
 pub mod lanczos;
 pub mod matrix;
 pub mod randomized;
@@ -67,6 +70,12 @@ pub use types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
 
 /// Re-exported so callers construct matrices without pinning `sprs` themselves.
 pub use sprs;
+
+/// Runs the README's Rust examples as doctests. `cfg(doctest)` keeps it out of the
+/// rendered docs, so the README gets checked without being duplicated.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
 
 /// The `rank` largest singular triplets.
 ///

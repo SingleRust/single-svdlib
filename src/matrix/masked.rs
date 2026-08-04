@@ -144,7 +144,10 @@ where
         v.sort_unstable();
         v.dedup();
         if let Some(&last) = v.last() {
-            assert!(last < limit, "{what} index {last} is out of bounds ({limit})");
+            assert!(
+                last < limit,
+                "{what} index {last} is out of bounds ({limit})"
+            );
         }
         v
     }
@@ -219,22 +222,14 @@ where
         self.matrix
     }
 
-    /// Materialise the view as an owned sparse matrix.
+    /// Copy the view into an owned sparse matrix. Still sparse — a subset copy, not a
+    /// densification — and the source is untouched.
     ///
-    /// Still sparse — this is a subset copy, not a densification — and the source is not
-    /// modified.
-    ///
-    /// # When this is worth doing
-    ///
-    /// A view does not make products cheaper on the masked axis: every product still
-    /// walks *all* the source's non-zeros and tests each against the column table. A view
-    /// that keeps a small fraction of the columns therefore scans far more than it uses.
-    ///
-    /// An iterative solver issues hundreds of products, so if the mask is restrictive the
-    /// one-off `O(nnz)` extraction is repaid almost immediately — extracting first is
-    /// usually much faster. Prefer the view when the mask keeps most columns, when the
-    /// copy would not fit alongside the source, or when only a handful of products are
-    /// needed.
+    /// A view doesn't make products cheaper: each one still walks every source non-zero
+    /// and checks it against the column table. Since a solver issues hundreds of
+    /// products, a restrictive mask usually repays the one-off `O(nnz)` copy almost
+    /// immediately. Stay with the view if the mask keeps most columns, if the copy
+    /// wouldn't fit alongside the source, or if you only need a few products.
     ///
     /// # Panics
     /// If the extracted index range would overflow the index type `I`.
@@ -279,6 +274,81 @@ where
     }
     fn nnz(&self) -> usize {
         self.nnz
+    }
+
+    /// Only the selected entries, so the norm describes the view and not the matrix it
+    /// borrows from.
+    fn squared_frobenius(&self) -> f64 {
+        if self.is_identity() {
+            return SparseMat::squared_frobenius(self.matrix);
+        }
+        let masked = !self.col_to_masked.is_empty();
+        (0..self.rows_len())
+            .into_par_iter()
+            .map(|i| {
+                let orig = self.row_of(i);
+                self.matrix.outer_view(orig).map_or(0.0, |row| {
+                    row.iter()
+                        .filter(|(j, _)| !masked || self.col_to_masked[j.index()] != EXCLUDED)
+                        .map(|(_, &v)| {
+                            let x = v.to_f64();
+                            x * x
+                        })
+                        .sum()
+                })
+            })
+            .sum()
+    }
+
+    /// Selected entries only, summed per entry so a column offset can't cancel it away.
+    fn centered_squared_frobenius(&self, means: ArrayView1<T>) -> f64 {
+        assert_eq!(
+            means.len(),
+            SparseMat::cols(self),
+            "centered_squared_frobenius: means must have length cols()"
+        );
+        if self.is_identity() {
+            return SparseMat::centered_squared_frobenius(self.matrix, means);
+        }
+        let rows = self.rows_len();
+        let ncols = SparseMat::cols(self);
+        let masked = !self.col_to_masked.is_empty();
+
+        // Sums and counts in one pass; splitting them would walk the view twice.
+        let (stored, col_nnz) = (0..rows)
+            .into_par_iter()
+            .fold(
+                || (0.0f64, vec![0usize; ncols]),
+                |(mut acc, mut cnt), i| {
+                    if let Some(row) = self.matrix.outer_view(self.row_of(i)) {
+                        for (j, &v) in row.iter() {
+                            let c = if masked {
+                                self.col_to_masked[j.index()]
+                            } else {
+                                j.index()
+                            };
+                            if c == EXCLUDED {
+                                continue;
+                            }
+                            let e = v.to_f64() - means[c].to_f64();
+                            acc += e * e;
+                            cnt[c] += 1;
+                        }
+                    }
+                    (acc, cnt)
+                },
+            )
+            .reduce(
+                || (0.0f64, vec![0usize; ncols]),
+                |(a1, mut c1), (a2, c2)| {
+                    for (x, y) in c1.iter_mut().zip(c2) {
+                        *x += y;
+                    }
+                    (a1 + a2, c1)
+                },
+            );
+
+        super::centered_from_parts(stored, &col_nnz, means, rows)
     }
 
     fn mul_vec(&self, x: &[T], y: &mut [T], trans: bool) {
@@ -405,8 +475,7 @@ where
                     let base = ci * chunk;
                     for (local, mut orow) in block.rows_mut().into_iter().enumerate() {
                         orow.fill(T::zero());
-                        let Some(row) = self.matrix.outer_view(self.row_of(base + local))
-                        else {
+                        let Some(row) = self.matrix.outer_view(self.row_of(base + local)) else {
                             continue;
                         };
                         for (j, &v) in row.indices().iter().zip(row.data().iter()) {
@@ -679,6 +748,68 @@ mod tests {
         }
     }
 
+    /// The norm must describe the view, not its source — otherwise a masked PCA's
+    /// explained-variance ratios come out silently too small.
+    #[test]
+    fn squared_frobenius_counts_only_selected_entries() {
+        let a = gen_sparse(120, 40, 0.1, 91);
+        let rows: Vec<usize> = (0..120).filter(|r| r % 4 != 0).collect();
+        let cols: Vec<usize> = (0..40).filter(|c| c % 3 == 0).collect();
+        let view = MaskedCsMat::submatrix(&a, Some(&rows), Some(&cols));
+
+        let want: f64 = physical(&a, &rows, &cols).iter().map(|&v| v * v).sum();
+        approx::assert_relative_eq!(view.squared_frobenius(), want, max_relative = 1e-12);
+
+        // Strictly less than the source, and equal to it once nothing is masked out.
+        assert!(view.squared_frobenius() < SparseMat::squared_frobenius(&a));
+        let identity = MaskedCsMat::submatrix(&a, None, None);
+        approx::assert_relative_eq!(
+            identity.squared_frobenius(),
+            SparseMat::squared_frobenius(&a),
+            max_relative = 1e-14
+        );
+        // The extraction is the same matrix, so it must report the same norm.
+        approx::assert_relative_eq!(
+            view.to_sparse().squared_frobenius(),
+            want,
+            max_relative = 1e-12
+        );
+    }
+
+    /// Same for the centered norm, and summed per entry so an offset can't cancel it.
+    #[test]
+    fn centered_squared_frobenius_matches_the_selected_submatrix() {
+        let a = gen_sparse(120, 40, 0.2, 77);
+        let rows: Vec<usize> = (0..120).filter(|r| r % 4 != 0).collect();
+        let cols: Vec<usize> = (0..40).filter(|c| c % 3 == 0).collect();
+        let view = MaskedCsMat::submatrix(&a, Some(&rows), Some(&cols));
+
+        let sub = physical(&a, &rows, &cols);
+        let means = view.col_means();
+        let centered = &sub - &means.view().insert_axis(Axis(0));
+        let want: f64 = centered.iter().map(|&v| v * v).sum();
+
+        approx::assert_relative_eq!(
+            view.centered_squared_frobenius(means.view()),
+            want,
+            max_relative = 1e-10
+        );
+        // The extraction is the same matrix, so it must agree.
+        approx::assert_relative_eq!(
+            SparseMat::centered_squared_frobenius(&view.to_sparse(), means.view()),
+            want,
+            max_relative = 1e-10
+        );
+        // A view that selects everything must match the source exactly.
+        let identity = MaskedCsMat::submatrix(&a, None, None);
+        let full_means = identity.col_means();
+        approx::assert_relative_eq!(
+            identity.centered_squared_frobenius(full_means.view()),
+            SparseMat::centered_squared_frobenius(&a, full_means.view()),
+            max_relative = 1e-12
+        );
+    }
+
     /// The extracted submatrix must be indistinguishable from the view.
     #[test]
     fn to_sparse_matches_the_view() {
@@ -696,7 +827,10 @@ mod tests {
         for i in 0..extracted.rows() {
             if let Some(row) = extracted.outer_view(i) {
                 let idx = row.indices();
-                assert!(idx.windows(2).all(|w| w[0] < w[1]), "row {i} indices not sorted");
+                assert!(
+                    idx.windows(2).all(|w| w[0] < w[1]),
+                    "row {i} indices not sorted"
+                );
             }
         }
 

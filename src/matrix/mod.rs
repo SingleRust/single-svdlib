@@ -13,6 +13,7 @@ pub mod masked;
 
 use crate::types::SvdFloat;
 use ndarray::{Array1, ArrayView1, ArrayView2, ArrayViewMut2};
+use rayon::prelude::*;
 use sprs::{CsMatI, CsMatViewI, SpIndex};
 
 pub use kernels::DEFAULT_SCRATCH_BUDGET;
@@ -40,6 +41,55 @@ pub trait SparseMat<T: SvdFloat>: Sync {
     /// `y` is fully overwritten. `x` must have length `cols()` (`rows()` when
     /// transposed) and `y` length `rows()` (`cols()` when transposed).
     fn mul_vec(&self, x: &[T], y: &mut [T], trans: bool);
+
+    /// `‖A‖²_F`. Accumulated in `f64` even for `f32` data — this sums every non-zero,
+    /// and an `f32` accumulator would drop the tail or overflow.
+    fn squared_frobenius(&self) -> f64;
+
+    /// `‖A − 1·meansᵀ‖²_F`.
+    ///
+    /// The default is the closed form `‖A‖²_F − rows·Σⱼ meanⱼ²`, which needs no pass over
+    /// the matrix but cancels badly when columns are large against their own spread: on
+    /// `f32` columns of `offset + O(1)` noise it is 3e-8 wrong at offset 0 and **5e-1**
+    /// wrong at offset 1000. Fine for counts data, where most entries are zero. The
+    /// built-in types override it with a per-entry sum that never cancels; do the same if
+    /// your data carries an offset.
+    fn centered_squared_frobenius(&self, means: ArrayView1<T>) -> f64 {
+        let shift: f64 = means.iter().map(|&m| m.to_f64() * m.to_f64()).sum();
+        (self.squared_frobenius() - self.rows() as f64 * shift).max(0.0)
+    }
+}
+
+/// `‖A‖²_F`, or the centered version when `means` is supplied. What the solvers store in
+/// [`SvdRec::total_squared_norm`](crate::SvdRec).
+pub fn total_squared_norm<T: SvdFloat, M: SparseMat<T> + ?Sized>(
+    a: &M,
+    means: Option<ArrayView1<T>>,
+) -> f64 {
+    match means {
+        Some(m) => a.centered_squared_frobenius(m),
+        None => a.squared_frobenius(),
+    }
+}
+
+/// `stored + Σⱼ (rows − nnzⱼ)·meanⱼ²`, where `stored` is `Σ (aᵢⱼ − meanⱼ)²` over the
+/// entries that exist. Every unstored entry contributes `meanⱼ²`.
+#[inline]
+fn centered_from_parts<T: SvdFloat>(
+    stored: f64,
+    col_nnz: &[usize],
+    means: ArrayView1<T>,
+    rows: usize,
+) -> f64 {
+    let missing: f64 = col_nnz
+        .iter()
+        .zip(means.iter())
+        .map(|(&n, &m)| {
+            let m = m.to_f64();
+            (rows - n) as f64 * m * m
+        })
+        .sum();
+    (stored + missing).max(0.0)
 }
 
 /// Blocked products, needed by the randomized solvers.
@@ -71,17 +121,14 @@ pub trait SparseMatDense<T: SvdFloat>: SparseMat<T> {
         Array1::from_vec(sums) * scale
     }
 
-    /// The product against the implicitly mean-centered matrix `A - 1·meansᵀ`.
-    ///
-    /// Centering a sparse matrix destroys its sparsity, so the correction is applied
-    /// as the rank-1 update it actually is:
+    /// The product against `A - 1·meansᵀ`, without ever forming it — centering a sparse
+    /// matrix would destroy its sparsity, so it goes in as the rank-1 update it is:
     ///
     /// - `trans == false`: `(A - 1·mᵀ)·D = A·D - 1·(mᵀ·D)`
     /// - `trans == true`:  `(A - 1·mᵀ)ᵀ·D = Aᵀ·D - m·(1ᵀ·D)`
     ///
-    /// Either way the correction is a single length-`k` vector, so this costs
-    /// `O(k·(rows + cols))` on top of the plain product and allocates nothing beyond
-    /// that vector.
+    /// The correction is one length-`k` vector either way, so it adds
+    /// `O(k·(rows + cols))` and allocates nothing else.
     fn mul_dense_centered(
         &self,
         rhs: ArrayView2<T>,
@@ -99,10 +146,8 @@ pub trait SparseMatDense<T: SvdFloat>: SparseMat<T> {
     }
 }
 
-/// Subtract the rank-1 centering term from an already-computed uncentered product.
-///
-/// Split out so implementors overriding [`SparseMatDense::mul_dense_centered`] for a
-/// fused kernel can still reuse the correction.
+/// Subtract the rank-1 centering term from an uncentered product. Public so an
+/// implementor writing a fused `mul_dense_centered` can reuse it.
 pub fn apply_centering<T: SvdFloat>(
     rhs: ArrayView2<T>,
     mut out: ArrayViewMut2<T>,
@@ -151,12 +196,10 @@ pub fn apply_centering<T: SvdFloat>(
     }
 }
 
-/// Resolve any compressed matrix to a CSR view plus a flag saying whether that view
-/// represents the transpose.
-///
-/// A CSC matrix is bit-for-bit a CSR matrix of its own transpose, so
-/// `transpose_view()` reaches it without copying. Every kernel is then written once,
-/// against CSR, and the caller's `trans` is XORed with the flag.
+/// A CSR view of any compressed matrix, plus a flag for whether the view is the
+/// transpose. CSC is bit-for-bit the CSR of its own transpose, so `transpose_view()`
+/// reaches it for free — every kernel is written once against CSR and the caller's
+/// `trans` is XORed with the flag.
 #[inline]
 fn csr_view<T, I: SpIndex, Iptr: SpIndex>(
     m: &CsMatI<T, I, Iptr>,
@@ -192,6 +235,70 @@ where
             kernels::gather_mul_vec(view, x, y);
         }
     }
+
+    fn squared_frobenius(&self) -> f64 {
+        // Storage order doesn't matter — every value appears once.
+        self.data()
+            .par_iter()
+            .map(|&v| {
+                let x = v.to_f64();
+                x * x
+            })
+            .sum()
+    }
+
+    fn centered_squared_frobenius(&self, means: ArrayView1<T>) -> f64 {
+        assert_eq!(
+            means.len(),
+            SparseMat::cols(self),
+            "centered_squared_frobenius: means must have length cols()"
+        );
+        let rows = SparseMat::rows(self);
+        let cols = SparseMat::cols(self);
+
+        if self.is_csc() {
+            // Outer dimension is the column, so the count comes for free.
+            let total: f64 = (0..cols)
+                .into_par_iter()
+                .map(|j| {
+                    let m = means[j].to_f64();
+                    let (sum, n) = self.outer_view(j).map_or((0.0, 0), |col| {
+                        (
+                            col.iter()
+                                .map(|(_, &v)| {
+                                    let e = v.to_f64() - m;
+                                    e * e
+                                })
+                                .sum::<f64>(),
+                            col.nnz(),
+                        )
+                    });
+                    sum + (rows - n) as f64 * m * m
+                })
+                .sum();
+            return total.max(0.0);
+        }
+
+        // CSR: count per column first, then sum the entries.
+        let mut col_nnz = vec![0usize; cols];
+        for j in self.indices() {
+            col_nnz[j.index()] += 1;
+        }
+        let stored: f64 = (0..rows)
+            .into_par_iter()
+            .map(|i| {
+                self.outer_view(i).map_or(0.0, |row| {
+                    row.iter()
+                        .map(|(j, &v)| {
+                            let e = v.to_f64() - means[j].to_f64();
+                            e * e
+                        })
+                        .sum()
+                })
+            })
+            .sum();
+        centered_from_parts(stored, &col_nnz, means, rows)
+    }
 }
 
 impl<T, I, Iptr> SparseMatDense<T> for CsMatI<T, I, Iptr>
@@ -223,6 +330,12 @@ impl<T: SvdFloat, M: SparseMat<T> + ?Sized> SparseMat<T> for &M {
     }
     fn mul_vec(&self, x: &[T], y: &mut [T], trans: bool) {
         (**self).mul_vec(x, y, trans)
+    }
+    fn squared_frobenius(&self) -> f64 {
+        (**self).squared_frobenius()
+    }
+    fn centered_squared_frobenius(&self, means: ArrayView1<T>) -> f64 {
+        (**self).centered_squared_frobenius(means)
     }
 }
 
@@ -327,6 +440,90 @@ mod tests {
         let want_t = centered.t().dot(&rhs_t);
         for (g, w) in out_t.iter().zip(want_t.iter()) {
             approx::assert_relative_eq!(g, w, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn squared_frobenius_matches_dense_and_is_storage_agnostic() {
+        let a = tiny_csr();
+        let d = dense_of(&a);
+        let want: f64 = d.iter().map(|&v| v * v).sum();
+        approx::assert_relative_eq!(SparseMat::squared_frobenius(&a), want, max_relative = 1e-14);
+        // Every stored value appears once whichever way the matrix is compressed.
+        approx::assert_relative_eq!(
+            SparseMat::squared_frobenius(&a.to_other_storage()),
+            want,
+            max_relative = 1e-14
+        );
+    }
+
+    /// Must equal building the centered matrix and summing it, in both storage orders.
+    #[test]
+    fn centered_squared_frobenius_matches_explicit_centering() {
+        let a = tiny_csr();
+        let d = dense_of(&a);
+        let means = SparseMatDense::col_means(&a);
+        let centered = &d - &means.view().insert_axis(ndarray::Axis(0));
+        let want: f64 = centered.iter().map(|&v| v * v).sum();
+
+        approx::assert_relative_eq!(
+            SparseMat::centered_squared_frobenius(&a, means.view()),
+            want,
+            max_relative = 1e-12
+        );
+        // CSC reaches the same answer by iterating columns instead of rows.
+        approx::assert_relative_eq!(
+            SparseMat::centered_squared_frobenius(&a.to_other_storage(), means.view()),
+            want,
+            max_relative = 1e-12
+        );
+    }
+
+    /// Centering can only remove norm, never add it, and never take it below zero.
+    #[test]
+    fn centering_never_increases_the_norm() {
+        let a = tiny_csr();
+        let means = SparseMatDense::col_means(&a);
+        let raw = SparseMat::squared_frobenius(&a);
+        let centered = SparseMat::centered_squared_frobenius(&a, means.view());
+        assert!(centered >= 0.0);
+        assert!(centered <= raw);
+    }
+
+    /// The closed form was 51% wrong at an `f32` offset of 1000. The per-entry form must
+    /// stay at machine precision and not degrade as the offset grows.
+    #[test]
+    fn centered_norm_survives_a_large_column_offset() {
+        for offset in [0.0f32, 10.0, 100.0, 1000.0] {
+            let (rows, cols) = (200usize, 20usize);
+            let mut t = sprs::TriMatI::<f32, u32>::new((rows, cols));
+            let mut dense = Array2::<f64>::zeros((rows, cols));
+            for i in 0..rows {
+                for j in 0..cols {
+                    let v = offset + (((i * 7 + j * 3) % 11) as f32 - 5.0) * 0.1;
+                    t.add_triplet(i, j, v);
+                    dense[[i, j]] = v as f64;
+                }
+            }
+            let a: SvdMat<f32> = t.to_csr::<u64>();
+            let means = SparseMatDense::col_means(&a);
+
+            // The reference uses the same f32 means the solver would, so this measures
+            // the summation and nothing else.
+            let mut want = 0.0f64;
+            for i in 0..rows {
+                for j in 0..cols {
+                    let e = dense[[i, j]] - means[j] as f64;
+                    want += e * e;
+                }
+            }
+
+            let got = SparseMat::centered_squared_frobenius(&a, means.view());
+            let rel = (got - want).abs() / want;
+            assert!(
+                rel < 1e-6,
+                "offset {offset}: centered norm {got:.6e} vs {want:.6e} (rel {rel:.3e})"
+            );
         }
     }
 

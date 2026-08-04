@@ -40,7 +40,7 @@ use crate::types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::rngs::StdRng;
-use rand::{rng, Rng, RngCore, SeedableRng};
+use rand::{rng, Rng, RngExt, SeedableRng};
 use rayon::prelude::*;
 use std::cell::Cell;
 use std::mem;
@@ -198,6 +198,8 @@ pub fn svd_las2<T: SvdFloat, M: SparseMat<T>>(
         u,
         s,
         vt,
+        // LAS2 has no centering mode, so this is the plain Frobenius norm.
+        total_squared_norm: T::from_f64_val(crate::matrix::total_squared_norm(a, None)),
         diagnostics: Diagnostics {
             algorithm: Algorithm::Las2,
             non_zero: a.nnz(),

@@ -140,7 +140,11 @@ fn wide_dynamic_range() {
     });
     let rec = irlba::svd_seed(&a, 5, 42).expect("wide dynamic range");
     assert!(rec.s.iter().all(|s| s.is_finite()), "{:?}", rec.s);
-    assert!(rec.s[0] > 1e11, "dominant scale should survive: {}", rec.s[0]);
+    assert!(
+        rec.s[0] > 1e11,
+        "dominant scale should survive: {}",
+        rec.s[0]
+    );
     for w in rec.s.to_vec().windows(2) {
         assert!(w[0] >= w[1], "not descending under wide range");
     }
@@ -176,7 +180,9 @@ fn nan_input_does_not_hang_or_claim_convergence() {
 fn randomized_survives_non_finite_input() {
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let a = from_triplets(30, 12, &[(0, 0, 1.0), (1, 1, bad), (2, 2, 3.0)]);
-        let cfg = randomized::RandomizedConfig::new(3).seed(42).power_iterations(2);
+        let cfg = randomized::RandomizedConfig::new(3)
+            .seed(42)
+            .power_iterations(2);
         match randomized::svd_with(&a, &cfg, None) {
             Err(_) => {}
             Ok(rec) => assert!(
@@ -263,7 +269,10 @@ fn exhausted_restart_budget_fails_loudly() {
     let rec = irlba::svd_with(&a, &lax, None).expect("best effort should be available");
     if !rec.converged() {
         let resid = rec.max_residual().expect("irlba tracks a residual");
-        assert!(resid > 0.0, "unconverged result must carry a positive residual");
+        assert!(
+            resid > 0.0,
+            "unconverged result must carry a positive residual"
+        );
     }
 }
 

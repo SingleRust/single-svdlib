@@ -39,7 +39,7 @@ use crate::types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
 use ndarray::{s, Array1, Array2, ArrayView2};
 use num_traits::Float;
 use rand::rngs::StdRng;
-use rand::{rng, Rng, RngCore, SeedableRng};
+use rand::{rng, Rng, RngExt, SeedableRng};
 
 /// Default relative residual tolerance.
 pub const DEFAULT_TOL: f64 = 1e-10;
@@ -432,6 +432,10 @@ pub fn svd_with<T: SvdFloat, M: SparseMat<T>>(
         u: u_out,
         s: s_out,
         vt: vt_out,
+        total_squared_norm: T::from_f64_val(crate::matrix::total_squared_norm(
+            a,
+            means.as_ref().map(|m| m.view()),
+        )),
         diagnostics: Diagnostics {
             algorithm: Algorithm::Irlba,
             non_zero: a.nnz(),
@@ -517,6 +521,14 @@ fn trivial_rank_one<T: SvdFloat, M: SparseMat<T>>(
         u,
         s: Array1::from_vec(vec![sigma]),
         vt,
+        total_squared_norm: T::from_f64_val(crate::matrix::total_squared_norm(
+            a,
+            if cfg.mean_center {
+                means.as_ref().map(|m| m.view())
+            } else {
+                None
+            },
+        )),
         diagnostics: Diagnostics {
             algorithm: Algorithm::Irlba,
             non_zero: a.nnz(),
@@ -731,11 +743,8 @@ impl<'a, T: SvdFloat, M: SparseMat<T>> Solve<'a, T, M> {
             let mut probe = Array1::<T>::zeros(self.op.rows());
             random_unit(&mut probe, &mut self.rng);
             let mut v0 = Array1::<T>::zeros(self.op.cols());
-            self.op.mul(
-                probe.as_slice().unwrap(),
-                v0.as_slice_mut().unwrap(),
-                true,
-            );
+            self.op
+                .mul(probe.as_slice().unwrap(), v0.as_slice_mut().unwrap(), true);
             self.matvecs += 1;
 
             let n = norm(&v0);

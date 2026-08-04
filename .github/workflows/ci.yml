@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # `--all-targets` covers the unit tests, the integration suites under
+      # `tests/` (cross-algorithm, robustness, and the proptest properties), and
+      # compiles the examples and benches. It does not run doctests, hence the
+      # second step.
+      - name: Test
+        run: cargo test --all-targets
+      # `las2` is off by default, so the default run never compiles that module.
+      - name: Test (all features)
+        run: cargo test --all-features --all-targets
+      - name: Doctests
+        run: cargo test --all-features --doc
+      - name: Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Format
+        run: cargo fmt --check
+
+  # `rust-version` in Cargo.toml is a promise; without this job it is only a comment.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      # Dev-dependencies routinely need a newer compiler than the library does, so the
+      # promise is checked against the library and its public API, not the test suite.
+      - name: Build at the declared MSRV
+        run: cargo build --all-features
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

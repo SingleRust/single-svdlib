@@ -31,7 +31,7 @@ use crate::matrix::SparseMatDense;
 use crate::types::{Algorithm, Detail, Diagnostics, SvdFloat, SvdRec};
 use ndarray::{s, Array1, Array2, Axis};
 use rand::rngs::StdRng;
-use rand::{rng, RngCore, SeedableRng};
+use rand::{rng, Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
 
 /// Default oversampling beyond the requested rank.
@@ -334,6 +334,10 @@ pub fn svd_with<T: SvdFloat, M: SparseMatDense<T>>(
         u,
         s,
         vt,
+        total_squared_norm: T::from_f64_val(crate::matrix::total_squared_norm(
+            a,
+            means.as_ref().map(|m| m.view()),
+        )),
         diagnostics: Diagnostics {
             algorithm: match cfg.sketch {
                 Sketch::PowerIteration { .. } => Algorithm::Randomized,

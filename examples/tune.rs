@@ -111,7 +111,12 @@ fn main() {
         Some(sub.col_means()),
     )
     .expect("reference failed");
-    println!("  sigma[0] = {:.2}, sigma[{}] = {:.2}\n", reference.s[0], k - 1, reference.s[k - 1]);
+    println!(
+        "  sigma[0] = {:.2}, sigma[{}] = {:.2}\n",
+        reference.s[0],
+        k - 1,
+        reference.s[k - 1]
+    );
 
     let err = |r: &SvdRec<f64>| {
         (0..k)

@@ -1,3 +1,10 @@
 /target
+
+# Editor state
 .idea
 .idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store

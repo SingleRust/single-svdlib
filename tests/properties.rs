@@ -529,3 +529,297 @@ proptest! {
         prop_assert!(err < 1e-9, "relative reconstruction {err:.3e}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Explained variance
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 200, max_shrink_iters: 2000, ..ProptestConfig::default() })]
+
+    /// Ratios must be in `[0, 1]`, descending, and sum to at most 1 — anything above 1
+    /// would claim more energy than the matrix has.
+    #[test]
+    fn explained_variance_ratios_are_a_partition((a, d) in matrix(20)) {
+        let min_dim = a.rows().min(a.cols());
+        let rank = (min_dim - 1).max(1);
+        let got = irlba::svd_seed(&a, rank, 42);
+        prop_assume!(got.is_ok(), "solver declined: {:?}", got.err());
+        let got = got.unwrap();
+
+        // Uncentered, so the denominator is the plain Frobenius norm.
+        let want_norm = d.iter().map(|v| v * v).sum::<f64>();
+        prop_assert!(
+            (got.total_squared_norm - want_norm).abs() <= 1e-9 * want_norm.max(f64::MIN_POSITIVE),
+            "total_squared_norm {:.6e} vs dense {:.6e}", got.total_squared_norm, want_norm
+        );
+
+        let ratio = got.explained_variance_ratio();
+        prop_assert_eq!(ratio.len(), got.d);
+        for &r in ratio.iter() {
+            prop_assert!(r.is_finite() && (-1e-12..=1.0 + 1e-9).contains(&r), "ratio {r:.6e}");
+        }
+        for w in ratio.to_vec().windows(2) {
+            prop_assert!(w[0] >= w[1] - 1e-12, "ratios not descending");
+        }
+        let total: f64 = ratio.iter().sum();
+        prop_assert!(total <= 1.0 + 1e-9, "ratios sum to {total:.12e}, above 1");
+
+        // explained_variance is the same quantity before normalising.
+        let denom = (got.nrows().saturating_sub(1).max(1)) as f64;
+        let ev = got.explained_variance();
+        for i in 0..got.d {
+            let want = got.s[i] * got.s[i] / denom;
+            prop_assert!(
+                (ev[i] - want).abs() <= 1e-12 * want.max(f64::MIN_POSITIVE),
+                "explained_variance[{i}] = {:.6e}, want {want:.6e}", ev[i]
+            );
+        }
+        // ...and total_variance is the denominator on that same scale.
+        prop_assert!(
+            (got.total_variance() * denom - got.total_squared_norm).abs()
+                <= 1e-9 * got.total_squared_norm.max(f64::MIN_POSITIVE)
+        );
+    }
+
+    /// Each ratio must match the dense spectrum's `sᵢ² / Σⱼ sⱼ²`. This is what pins the
+    /// denominator: ratios that only have to sum to under 1 can still be uniformly
+    /// scaled by a wrong total. IRLBA can't be asked for the full `min_dim`, so the sum
+    /// over `d` is always partial.
+    #[test]
+    fn ratios_match_the_dense_spectrum((a, d) in matrix(16)) {
+        let min_dim = a.rows().min(a.cols());
+        let rank = (min_dim - 1).max(1);
+        let want = reference(&d);
+        let want_total: f64 = want.iter().map(|v| v * v).sum();
+        // A matrix that is entirely zero has no energy to apportion.
+        prop_assume!(want_total > 1e-12);
+
+        let got = irlba::svd_seed(&a, rank, 42);
+        prop_assume!(got.is_ok(), "solver declined: {:?}", got.err());
+        let got = got.unwrap();
+
+        let ratio = got.explained_variance_ratio();
+        for i in 0..got.d {
+            let expect = want[i] * want[i] / want_total;
+            prop_assert!(
+                (ratio[i] - expect).abs() < 1e-8,
+                "ratio[{i}] = {:.12e}, dense says {expect:.12e} (shape {:?})",
+                ratio[i], (a.rows(), a.cols())
+            );
+        }
+    }
+
+    /// After centering, the denominator must describe the centered matrix, not the input.
+    #[test]
+    fn centered_norm_matches_explicitly_centered_matrix((a, d) in matrix(16)) {
+        let min_dim = a.rows().min(a.cols());
+        let rank = (min_dim - 1).max(1);
+        let got = irlba::svd_centered(&a, rank, Some(42));
+        prop_assume!(got.is_ok(), "solver declined: {:?}", got.err());
+        let got = got.unwrap();
+
+        let means = d.mean_axis(Axis(0)).unwrap();
+        let centered = &d - &means.view().insert_axis(Axis(0));
+        let want = centered.iter().map(|v| v * v).sum::<f64>();
+
+        prop_assert!(
+            (got.total_squared_norm - want).abs() <= 1e-8 * want.max(f64::MIN_POSITIVE) + 1e-12,
+            "centered norm {:.6e} vs dense {:.6e}", got.total_squared_norm, want
+        );
+        let total: f64 = got.explained_variance_ratio().iter().sum();
+        prop_assert!(total <= 1.0 + 1e-8, "centered ratios sum to {total:.12e}");
+    }
+
+    /// Scores must equal `u · diag(s)`.
+    #[test]
+    fn scores_equal_u_times_sigma((a, _d) in matrix(18)) {
+        let min_dim = a.rows().min(a.cols());
+        let rank = (min_dim - 1).max(1);
+        let got = irlba::svd_seed(&a, rank, 42);
+        prop_assume!(got.is_ok());
+        let got = got.unwrap();
+
+        let scores = got.scores();
+        prop_assert_eq!(scores.dim(), (got.nrows(), got.d));
+        for i in 0..got.nrows() {
+            for j in 0..got.d {
+                let want = got.u[[i, j]] * got.s[j];
+                prop_assert!((scores[[i, j]] - want).abs() <= 1e-12 * want.abs().max(1.0));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f32
+// ---------------------------------------------------------------------------
+
+/// `SvdFloat` is public and generic over `f32`, but everything above runs in `f64`.
+/// These repeat the load-bearing invariants at single precision. Tolerances are
+/// `f32`-relative against the same operand widened to `f64`, so a failure means the
+/// `f32` path lost more than the precision itself explains.
+mod f32_paths {
+    use super::*;
+
+    /// Modest dynamic range — a `1e8` spread would wipe out the small entries in `f32`,
+    /// which tests the float type rather than the algorithm.
+    fn value_f32() -> impl Strategy<Value = f32> {
+        prop_oneof![
+            4 => -10.0f32..10.0,
+            2 => (-3i32..3, 1.0f32..10.0, any::<bool>())
+                .prop_map(|(e, m, neg)| { let v = m * 10f32.powi(e); if neg { -v } else { v } }),
+            2 => (-8i32..8).prop_map(|v| v as f32),
+            1 => Just(0.0f32),
+        ]
+    }
+
+    /// An `f32` matrix plus the same content in `f64`, so the reference is exact.
+    fn matrix32(max_dim: usize) -> impl Strategy<Value = (SvdMat<f32>, Array2<f64>)> {
+        (2usize..=max_dim, 2usize..=max_dim).prop_flat_map(|(rows, cols)| {
+            proptest::collection::vec(value_f32(), rows * cols).prop_map(move |vals| {
+                let mut tri = TriMatI::<f32, u32>::new((rows, cols));
+                let mut dense = Array2::<f64>::zeros((rows, cols));
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let v = vals[i * cols + j];
+                        dense[[i, j]] = v as f64;
+                        if v != 0.0 {
+                            tri.add_triplet(i, j, v);
+                        }
+                    }
+                }
+                (tri.to_csr::<u64>(), dense)
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 200, max_shrink_iters: 2000, ..ProptestConfig::default() })]
+
+        /// Values must land at `f32` precision against an `f64` reference.
+        #[test]
+        fn irlba_f32_matches_dense_reference((a, d) in matrix32(20)) {
+            let min_dim = a.rows().min(a.cols());
+            let rank = (min_dim - 1).max(1);
+            let want = reference(&d);
+            let s = scale(&want);
+
+            let got = irlba::svd_seed(&a, rank, 42);
+            prop_assume!(got.is_ok(), "solver declined: {:?}", got.err());
+            let got = got.unwrap();
+
+            for i in 0..got.d {
+                let err = (got.s[i] as f64 - want[i]).abs();
+                prop_assert!(
+                    err <= 1e-4 * s,
+                    "f32 triplet {i}: got {:.9e}, want {:.9e}, abs err {:.3e} vs scale {:.3e}",
+                    got.s[i], want[i], err, s
+                );
+            }
+        }
+
+        /// Shapes, ordering, finiteness and orthonormality in `f32`.
+        #[test]
+        fn irlba_f32_output_is_well_formed((a, _d) in matrix32(18)) {
+            let min_dim = a.rows().min(a.cols());
+            let rank = (min_dim - 1).max(1);
+            let got = irlba::svd_seed(&a, rank, 42);
+            prop_assume!(got.is_ok());
+            let got = got.unwrap();
+
+            prop_assert_eq!(got.u.dim(), (a.rows(), got.d));
+            prop_assert_eq!(got.vt.dim(), (got.d, a.cols()));
+            prop_assert!(got.s.iter().all(|v| v.is_finite() && *v >= 0.0));
+            for w in got.s.to_vec().windows(2) {
+                prop_assert!(w[0] >= w[1], "f32 singular values not descending");
+            }
+
+            // ||U^T U - I||, computed in f64 so the check itself is not the limit.
+            for p in 0..got.d {
+                for q in 0..got.d {
+                    let dot: f64 = (0..got.u.nrows())
+                        .map(|i| got.u[[i, p]] as f64 * got.u[[i, q]] as f64)
+                        .sum();
+                    let want = if p == q { 1.0 } else { 0.0 };
+                    prop_assert!(
+                        (dot - want).abs() < 1e-4,
+                        "f32 U^T U [{p},{q}] = {dot:.6e}, want {want}"
+                    );
+                }
+            }
+        }
+
+        /// `A·vᵢ = σᵢ·uᵢ` at `f32` — catches a wrong vector, not just an inaccurate value.
+        #[test]
+        fn irlba_f32_triplets_satisfy_definition((a, d) in matrix32(16)) {
+            let min_dim = a.rows().min(a.cols());
+            let rank = (min_dim - 1).max(1);
+            let got = irlba::svd_seed(&a, rank, 42);
+            prop_assume!(got.is_ok());
+            let got = got.unwrap();
+            let smax = got.s.iter().fold(0.0f32, |m, &v| m.max(v)) as f64;
+            prop_assume!(smax > 1e-6);
+
+            for i in 0..got.d {
+                let v: Vec<f64> = got.vt.row(i).iter().map(|&x| x as f64).collect();
+                let av = d.dot(&ndarray::Array1::from_vec(v));
+                let resid: f64 = av
+                    .iter()
+                    .zip(got.u.column(i).iter())
+                    .map(|(&x, &ui)| { let e = x - got.s[i] as f64 * ui as f64; e * e })
+                    .sum::<f64>()
+                    .sqrt();
+                prop_assert!(
+                    resid / smax < 1e-4,
+                    "f32 residual for triplet {i}: {:.3e} against sigma_max {smax:.3e}",
+                    resid / smax
+                );
+            }
+        }
+
+        /// Centering subtracts near-equal quantities, so it's where `f32` fails first.
+        #[test]
+        fn irlba_f32_centered_matches_dense((a, d) in matrix32(16)) {
+            let min_dim = a.rows().min(a.cols());
+            let rank = (min_dim - 1).max(1);
+
+            let means = d.mean_axis(Axis(0)).unwrap();
+            let centered = &d - &means.view().insert_axis(Axis(0));
+            let want = reference(&centered);
+            let s = scale(&want);
+            prop_assume!(s > 1e-4);
+
+            let got = irlba::svd_centered(&a, rank, Some(42));
+            prop_assume!(got.is_ok(), "solver declined: {:?}", got.err());
+            let got = got.unwrap();
+
+            for i in 0..got.d {
+                let err = (got.s[i] as f64 - want[i]).abs();
+                prop_assert!(
+                    err <= 1e-3 * s,
+                    "f32 centered triplet {i}: got {:.9e}, want {:.9e}, abs err {:.3e} vs scale {:.3e}",
+                    got.s[i], want[i], err, s
+                );
+            }
+        }
+
+        /// The variance denominator must survive `f32` too.
+        #[test]
+        fn f32_explained_variance_is_well_formed((a, d) in matrix32(16)) {
+            let min_dim = a.rows().min(a.cols());
+            let rank = (min_dim - 1).max(1);
+            let got = irlba::svd_seed(&a, rank, 42);
+            prop_assume!(got.is_ok());
+            let got = got.unwrap();
+
+            let want_norm: f64 = d.iter().map(|v| v * v).sum();
+            prop_assume!(want_norm > 1e-6);
+            let rel = (got.total_squared_norm as f64 - want_norm).abs() / want_norm;
+            prop_assert!(rel < 1e-5, "f32 total_squared_norm rel err {rel:.3e}");
+
+            let total: f32 = got.explained_variance_ratio().iter().sum();
+            prop_assert!(total <= 1.0 + 1e-5, "f32 ratios sum to {total:.9e}");
+        }
+    }
+}

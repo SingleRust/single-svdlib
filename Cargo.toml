@@ -7,30 +7,42 @@ name = "single-svdlib"
 version = "2.0.0"
 edition = "2021"
 rust-version = "1.88"
-license-file = "SVDLIBC-LICENSE.txt"
+license = "BSD-3-Clause"
 repository = "https://github.com/SingleRust/single-svdlib"
+homepage = "https://github.com/SingleRust/single-svdlib"
+documentation = "https://docs.rs/single-svdlib"
+readme = "README.md"
+exclude = [".vscode", ".github", "GEMINI.md"]
+
+[features]
+las2 = []
 
 [package.metadata.docs.rs]
 all-features = true
 
 [dependencies]
-# `default-features = false` drops sprs's `alga` feature (unmaintained since 2019).
-# We also skip its `multi_thread` feature: that only parallelises sparse-sparse
-# products, which this crate never performs, and we drive rayon ourselves.
 sprs = { version = "0.11.5", default-features = false }
-ndarray = { version = "0.16", features = ["rayon"] }
+ndarray = { version = "0.17.2", features = ["rayon"] }
 num-traits = "0.2.19"
-rand = "0.9"
-rand_distr = "0.5"
-rayon = "1.10"
-thiserror = "2.0"
+rand = "0.10.2"
+rand_distr = "0.6"
+rayon = "1.12"
+thiserror = "2.0.19"
 single-utilities = "0.9.0"
 
 [dev-dependencies]
 approx = "0.5"
-# Test-only: an independent reference factorization to check our own against.
-nalgebra = "0.34"
+criterion = "0.8"
+nalgebra = "0.35"
 proptest = "1"
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "solvers"
+harness = false
 
 [profile.bench]
 lto = "thin"

@@ -6,8 +6,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use ndarray::{Array2, Axis};
-use single_svdlib::{irlba, randomized, MaskedCsMat, SparseMat, SvdMat, SvdRec};
+use ndarray::{Array1, Array2, Axis};
+use single_svdlib::{irlba, randomized, MaskedCsMat, SparseMat, SparseMatDense, SvdMat, SvdRec};
 use sprs::{SpIndex, TriMatI};
 
 // ---------------------------------------------------------------------------
@@ -296,6 +296,86 @@ fn masked_pca_matches_dense_reference() {
             want[i]
         );
     }
+
+    // The denominator must be the centered submatrix. Using the full 40-column matrix
+    // would make every ratio proportionally too small but still look well-formed.
+    let want_total: f64 = centered.iter().map(|v| v * v).sum();
+    let rel_norm = (got.total_squared_norm - want_total).abs() / want_total;
+    assert!(
+        rel_norm < 1e-12,
+        "masked centered norm {:.9e} vs dense {want_total:.9e} (rel {rel_norm:.3e})",
+        got.total_squared_norm
+    );
+
+    let ratio = got.explained_variance_ratio();
+    for i in 0..rank {
+        let expect = want[i] * want[i] / want_total;
+        assert!(
+            (ratio[i] - expect).abs() < 1e-9,
+            "masked explained_variance_ratio[{i}] = {:.9e} vs {expect:.9e}",
+            ratio[i]
+        );
+    }
+    // sklearn's convention: the ratio is explained_variance / total_variance.
+    let ev = got.explained_variance();
+    for i in 0..rank {
+        approx::assert_relative_eq!(ev[i] / got.total_variance(), ratio[i], max_relative = 1e-12);
+    }
+}
+
+/// f32 PCA on columns with a large offset: centering subtracts near-equal quantities
+/// and f32 has only ~7 digits to spend on the difference.
+#[test]
+fn f32_centered_with_column_offset() {
+    let (rows, cols) = (300usize, 24usize);
+    let mut t = TriMatI::<f32, u32>::new((rows, cols));
+    let mut dense = Array2::<f64>::zeros((rows, cols));
+    for i in 0..rows {
+        for j in 0..cols {
+            // A rank-structured signal of size ~1, sitting on an offset of 500.
+            let signal =
+                ((i % 5) as f32) * ((j % 3) as f32) * 0.25 + ((i * 3 + j) % 7) as f32 * 0.1;
+            let v = 500.0 + signal;
+            t.add_triplet(i, j, v);
+            dense[[i, j]] = v as f64;
+        }
+    }
+    let a: SvdMat<f32> = t.to_csr::<u64>();
+
+    // Center in f64 using the same f32 means the solver uses, so this measures the
+    // solver and not the representation.
+    let means = SparseMatDense::col_means(&a);
+    let means64 = Array1::from_iter(means.iter().map(|&m| m as f64));
+    let centered = &dense - &means64.view().insert_axis(Axis(0));
+    let want = reference(&centered);
+    let want_norm: f64 = centered.iter().map(|&v| v * v).sum();
+
+    let got = irlba::svd_centered(&a, 5, Some(42)).unwrap();
+    assert!(got.converged());
+
+    let scale = want[0].max(1e-30);
+    for i in 0..got.d {
+        let err = (got.s[i] as f64 - want[i]).abs();
+        assert!(
+            err < 1e-3 * scale,
+            "f32 offset PCA value {i}: {:.6e} vs {:.6e} (abs err {err:.3e}, scale {scale:.3e})",
+            got.s[i],
+            want[i]
+        );
+    }
+
+    // The denominator is what cancels — the closed form was 51% wrong here.
+    let rel = (got.total_squared_norm as f64 - want_norm).abs() / want_norm;
+    assert!(
+        rel < 1e-5,
+        "f32 offset centered norm {:.6e} vs {want_norm:.6e} (rel {rel:.3e})",
+        got.total_squared_norm
+    );
+    let total: f32 = got.explained_variance_ratio().iter().sum();
+    assert!(
+        total <= 1.0 + 1e-5,
+        "f32 offset ratios sum to {total:.9e}, above 1"
+    );
 }
 
 /// f32 must work end to end and land at f32 precision.
@@ -347,7 +427,9 @@ fn out_of_range_rank_is_an_error() {
     assert!(single_svdlib::svd(&a, 0).is_err());
 }
 
-/// The deprecated module must still compile and run — 2.0 does not remove the API.
+/// The deprecated module must still compile and run when its feature is enabled — 2.0
+/// gates the API off by default but does not remove it.
+#[cfg(feature = "las2")]
 #[test]
 #[allow(deprecated)]
 fn deprecated_lanczos_still_callable() {
