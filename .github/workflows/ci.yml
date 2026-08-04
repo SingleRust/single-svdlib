@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       # Dev-dependencies routinely need a newer compiler than the library does, so the
       # promise is checked against the library and its public API, not the test suite.
       - name: Build at the declared MSRV
